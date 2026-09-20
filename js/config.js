@@ -5,4 +5,20 @@ window.APP_CONFIG = {
   SITE_NAME: "FP Training",
   SUPABASE_URL: "https://kuusnruaokehqrfwjkbx.supabase.co",
   SUPABASE_ANON_KEY: "sb_publishable_wmFIjTEziLzLQL0KLdpShw_CaWt_yQf"
+
+    // Small links shown in the thin bar above the header (company site, support, etc).
+  // Leave the list empty to hide the bar.
+  UTILITY_LINKS: [
+    { label: "Fluidra USA", url: "https://www.fluidrausa.com/en" },
+    { label: "Jandy®", url: "https://www.jandy.com/en" },
+    { label: "Polaris®", url: "https://www.polarispool.com/en" },
+    { label: "Taylor®", url: "https://taylortechnologies.com/" }
+  ],
+
+  // Text on the sign-in landing page.
+  HERO_TITLE: "Training designed with you in mind",
+  HERO_TEXT: "Short video lessons in a set order, troubleshooting guides you can pull up on site, and a certificate when you finish a course.",
+
+  // How many course cards to show per page.
+  PAGE_SIZE: 4
 };
