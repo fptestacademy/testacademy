@@ -1,4 +1,4 @@
-# Fieldbook Training
+# FP test Academy Training
 
 A training site with accounts, learning paths, video lessons, troubleshooting guides, certificates, and an admin report of who has completed what. It runs free on GitHub Pages plus a free Supabase project. There is no build step: plain HTML, CSS, and JavaScript.
 
