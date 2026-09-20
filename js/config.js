@@ -10,9 +10,9 @@ window.APP_CONFIG = {
   // Leave the list empty to hide the bar.
   UTILITY_LINKS: [
     { label: "Fluidra USA", url: "https://www.fluidrausa.com/en" },
-    { label: "Jandy®", url: "https://www.jandy.com/en" },
-    { label: "Polaris®", url: "https://www.polarispool.com/en" },
-    { label: "Taylor®", url: "https://taylortechnologies.com/" }
+    { label: "Jandy\u00AE", url: "https://www.jandy.com/en" },
+    { label: "Polaris\u00AE", url: "https://www.polarispool.com/en" },
+    { label: "Taylor\u00AE", url: "https://taylortechnologies.com/" }
   ],
 
   // Text on the sign-in landing page.
