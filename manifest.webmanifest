@@ -1,6 +1,6 @@
 {
-  "name": "Fieldbook Training",
-  "short_name": "Fieldbook",
+  "name": "FPtest Academy Training",
+  "short_name": "FPtA",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#F5F7F9",
