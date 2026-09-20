@@ -4,7 +4,7 @@
 window.APP_CONFIG = {
   SITE_NAME: "FP Training",
   SUPABASE_URL: "https://kuusnruaokehqrfwjkbx.supabase.co",
-  SUPABASE_ANON_KEY: "sb_publishable_wmFIjTEziLzLQL0KLdpShw_CaWt_yQf"
+  SUPABASE_ANON_KEY: "sb_publishable_wmFIjTEziLzLQL0KLdpShw_CaWt_yQf",
 
     // Small links shown in the thin bar above the header (company site, support, etc).
   // Leave the list empty to hide the bar.
