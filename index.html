@@ -10,13 +10,23 @@
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="css/styles.css">
 </head>
 <body>
   <a class="skip" href="#app">Skip to content</a>
-  <header class="topbar"><div class="wrap topbar-in" id="topbar"></div></header>
-  <main id="app" class="wrap" tabindex="-1"><p class="muted pad">Loading…</p></main>
+
+  <div class="utility" id="utility"></div>
+  <header class="site-header">
+    <div class="wrap header-in" id="topbar"></div>
+  </header>
+
+  <main id="app" tabindex="-1"><div class="wrap"><p class="muted pad">Loading…</p></div></main>
+
+  <footer class="site-footer">
+    <div class="wrap footer-in" id="footer"></div>
+  </footer>
+
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.116.0/dist/umd/supabase.js"></script>
