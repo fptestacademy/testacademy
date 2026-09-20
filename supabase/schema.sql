@@ -30,6 +30,9 @@ create table if not exists public.courses (
   sort int not null default 0
 );
 
+-- Optional thumbnail shown on the course card (a full https:// image URL). Safe to run again.
+alter table public.courses add column if not exists image_url text;
+
 create table if not exists public.lessons (
   id bigint generated always as identity primary key,
   course_id bigint not null references public.courses (id) on delete cascade,
