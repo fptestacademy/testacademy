@@ -252,9 +252,14 @@
         bindAuth(async ({ full_name, email, password }) => {
           if (!full_name.trim()) throw new Error("Enter your full name.");
           if (password.length < 8) throw new Error("Use a password with 8 characters or more.");
+          // Put the page they were heading to inside the confirmation link, so it survives
+          // the email being opened in a different browser, app, or device.
+          let dest = "";
+          try { dest = localStorage.getItem(RETURN_KEY) || ""; } catch (_) {}
+          const redirect = dest.startsWith("#/") ? `${BASE_URL}?next=${encodeURIComponent(dest)}` : BASE_URL;
           const { data, error } = await sb.auth.signUp({
             email: email.trim(), password,
-            options: { data: { full_name: full_name.trim() }, emailRedirectTo: BASE_URL },
+            options: { data: { full_name: full_name.trim() }, emailRedirectTo: redirect },
           });
           if (error) throw error;
           if (data.user && data.user.identities && data.user.identities.length === 0)
@@ -263,7 +268,7 @@
             session = data.session; await loadProfile(); goAfterAuth();
           } else {
             app.innerHTML = `<section class="narrow pad"><h1>Check your email</h1>
-              <p>We sent a confirmation link to <strong>${esc(email)}</strong>. Open it on this device and you will be signed in and taken to the page you wanted.</p></section>`;
+              <p>We sent a confirmation link to <strong>${esc(email)}</strong>. Open it and you will be signed in and taken to the page you wanted.</p></section>`;
           }
         });
       },
@@ -688,12 +693,21 @@
     session = data.session;
     if (session) await loadProfile();
 
+    // Coming back from a confirmation email: the destination rides along as ?next=#/lesson/...
+    const next = new URLSearchParams(location.search).get("next");
+    let cameWithNext = false;
+    if (next && next.startsWith("#/")) {
+      cameWithNext = true;
+      try { localStorage.setItem(RETURN_KEY, next); } catch (_) {}
+    }
+    if (location.search) history.replaceState(null, "", BASE_URL + location.hash);   // tidy the address bar
+
     window.addEventListener("hashchange", render);
 
     if (cameFromRecovery && session) { go("#/new-password"); return; }
     if (!location.hash.startsWith("#/")) {
       if (session) { goAfterAuth(); return; }
-      if (flash) { go("#/login"); return; }
+      if (flash || cameWithNext) { go("#/login"); return; }   // confirmed but not signed in here: sign in, then continue
       history.replaceState(null, "", BASE_URL + "#/");
     }
     render();
