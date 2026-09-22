@@ -1546,7 +1546,11 @@
     if (session && ["", "login", "signup"].includes(r.name)) { goAfterAuth(); return; }
     if (session && !["welcome", "verify", "new-password"].includes(r.name)) {
       try { await loadSurvey(); } catch (_) { survey = { questions: [], answers: new Map() }; }
-      if (surveyPending()) { go("#/welcome"); return; }
+      if (surveyPending()) {
+        // Remember where they were going (a shared lesson, say) so the survey can send them there afterwards.
+        try { if (r.name !== "learn") localStorage.setItem(RETURN_KEY, location.hash); } catch (_) {}
+        go("#/welcome"); return;
+      }
     }
 
     try {
@@ -1632,5 +1636,3 @@
 
   start();
 })();
-
-
