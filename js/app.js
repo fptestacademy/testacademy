@@ -32,6 +32,8 @@
   let session = null;
   let profile = null;
   let catalog = null;       // { paths, courses, lessons } without lesson bodies
+  let survey = null;        // { questions: [{...options:[{...paths:[]}]}], answers: Map(question_id -> option_id) }
+  const SKIP_KEY = "surveySkipped";
   let renderToken = 0;
 
   // ---------- helpers ----------
@@ -40,6 +42,119 @@
   const fmtDate = (d) => new Date(d).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
   const linkTo = (hash) => BASE_URL + hash;
   const md = (text) => DOMPurify.sanitize(marked.parse(text || ""));
+
+  // pdf.js is loaded only when a guide needs it (viewer or upload).
+  const PDFJS = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/legacy/build/";
+  let pdfjsPromise = null;
+  function loadPdfjs() {
+    if (!pdfjsPromise) pdfjsPromise = import(PDFJS + "pdf.min.mjs").then((lib) => {
+      lib.GlobalWorkerOptions.workerSrc = PDFJS + "pdf.worker.min.mjs";
+      return lib;
+    });
+    return pdfjsPromise;
+  }
+
+  // PDF viewer: pages drawn to canvas at the chosen zoom, with zoom and full-screen controls.
+  // There is no toolbar from the browser, no download button, and no link to the file.
+  async function mountPdfViewer(root, url) {
+    const pdfjs = await loadPdfjs();
+    const doc = await pdfjs.getDocument({ url }).promise;
+    const ZOOMS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
+    let zi = 2;                          // 1 = fit width
+    root.innerHTML = `
+      <div class="pdf-bar">
+        <span class="pdf-pages">${doc.numPages} page${doc.numPages === 1 ? "" : "s"}</span>
+        <span class="pdf-zoom">
+          <button type="button" class="icon-btn" data-z="-1" aria-label="Zoom out">&minus;</button>
+          <button type="button" class="pdf-pct" data-z="0" title="Fit to width">100%</button>
+          <button type="button" class="icon-btn" data-z="1" aria-label="Zoom in">+</button>
+        </span>
+        <button type="button" class="btn btn-ghost btn-sm" data-fs>Full screen</button>
+      </div>
+      <div class="pdf-pages-wrap" tabindex="0" aria-label="Guide pages"></div>`;
+    const wrap = root.querySelector(".pdf-pages-wrap"), pct = root.querySelector(".pdf-pct");
+    const pages = [];
+    for (let n = 1; n <= doc.numPages; n++) pages.push(await doc.getPage(n));
+    let token = 0;
+
+    async function draw() {
+      const t = ++token;
+      const fit = (wrap.clientWidth - 32) / pages[0].getViewport({ scale: 1 }).width;
+      const scale = fit * ZOOMS[zi];
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      pct.textContent = Math.round(ZOOMS[zi] * 100) + "%";
+      wrap.innerHTML = "";
+      for (const page of pages) {
+        if (t !== token) return;
+        const vp = page.getViewport({ scale: scale * dpr });
+        const canvas = document.createElement("canvas");
+        canvas.width = vp.width; canvas.height = vp.height;
+        canvas.style.width = Math.round(vp.width / dpr) + "px";
+        wrap.appendChild(canvas);
+        await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+      }
+    }
+
+    root.addEventListener("click", (e) => {
+      const z = e.target.closest("[data-z]");
+      if (z) {
+        const d = Number(z.dataset.z);
+        zi = d === 0 ? 2 : Math.min(ZOOMS.length - 1, Math.max(0, zi + d));
+        draw();
+        return;
+      }
+      if (e.target.closest("[data-fs]")) {
+        if (document.fullscreenElement) document.exitFullscreen();
+        else if (root.requestFullscreen) root.requestFullscreen();
+        else root.classList.toggle("pdf-fake-fs");   // iPhone Safari has no full-screen API for elements
+      }
+    });
+    root.addEventListener("contextmenu", (e) => e.preventDefault());
+    document.addEventListener("fullscreenchange", () => {
+      root.querySelector("[data-fs]").textContent = document.fullscreenElement === root ? "Exit full screen" : "Full screen";
+      draw();
+    });
+    // Ctrl/Cmd + wheel and pinch on trackpads
+    wrap.addEventListener("wheel", (e) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      zi = Math.min(ZOOMS.length - 1, Math.max(0, zi + (e.deltaY < 0 ? 1 : -1)));
+      draw();
+    }, { passive: false });
+    // Two-finger pinch on phones (the page itself does not zoom, the guide does)
+    let pinch = null;
+    wrap.addEventListener("touchstart", (e) => { if (e.touches.length === 2) pinch = { d: dist(e), zi }; }, { passive: true });
+    wrap.addEventListener("touchmove", (e) => {
+      if (!pinch || e.touches.length !== 2) return;
+      const r = dist(e) / pinch.d;
+      const want = r > 1.25 ? pinch.zi + 1 : r < 0.8 ? pinch.zi - 1 : pinch.zi;
+      const next = Math.min(ZOOMS.length - 1, Math.max(0, want));
+      if (next !== zi) { zi = next; pinch = { d: dist(e), zi }; draw(); }
+    }, { passive: true });
+    wrap.addEventListener("touchend", () => { pinch = null; });
+    const dist = (e) => Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+    let rt; window.addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(draw, 150); });
+    await draw();
+  }
+
+  // Pull the text out of a PDF so guides stay searchable.
+  async function extractPdfText(file) {
+    const pdfjs = await loadPdfjs();
+    const doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+    const parts = [];
+    for (let n = 1; n <= doc.numPages; n++) {
+      const tc = await (await doc.getPage(n)).getTextContent();
+      parts.push(tc.items.map((it) => it.str).join(" "));
+      if (parts.join(" ").length > 200000) break;
+    }
+    return parts.join("\n").replace(/\s+/g, " ").trim().slice(0, 200000);
+  }
+
+  async function signedPdfUrl(path) {
+    const { data, error } = await sb.storage.from("guides").createSignedUrl(path, 3600);
+    if (error) throw new Error(error.message);
+    return data.signedUrl;
+  }
 
   function toast(msg) {
     const el = document.getElementById("toast");
@@ -93,7 +208,7 @@
     const [p, c, l] = await Promise.all([
       sb.from("paths").select("*").order("sort"),
       sb.from("courses").select("*").order("sort"),
-      sb.from("lessons").select("id,course_id,slug,title,kind,minutes,sort,video_url").order("sort"),
+      sb.from("lessons").select("id,course_id,slug,title,kind,minutes,sort,video_url,description,pdf_path").order("sort"),
     ]);
     const err = p.error || c.error || l.error;
     if (err) throw err;
@@ -113,6 +228,41 @@
       .select("id,course_id,issued_at").eq("user_id", session.user.id).order("issued_at", { ascending: false });
     if (error) throw error;
     return data;
+  }
+
+  async function loadSurvey() {
+    if (survey) return survey;
+    const [qs, os, ops, an] = await Promise.all([
+      sb.from("survey_questions").select("*").eq("active", true).order("sort"),
+      sb.from("survey_options").select("*").order("sort"),
+      sb.from("survey_option_paths").select("*"),
+      sb.from("survey_answers").select("question_id,option_id").eq("user_id", session.user.id),
+    ]);
+    const err = qs.error || os.error || ops.error || an.error;
+    if (err) throw err;
+    const questions = qs.data.map((q) => ({ ...q, options: os.data.filter((o) => o.question_id === q.id)
+      .map((o) => ({ ...o, paths: ops.data.filter((x) => x.option_id === o.id).map((x) => x.path_id) })) }));
+    survey = { questions, answers: new Map(an.data.map((a) => [a.question_id, a.option_id])) };
+    return survey;
+  }
+
+  function surveyPending() {
+    if (!survey || profile?.is_admin) return false;
+    let skipped = false;
+    try { skipped = !!sessionStorage.getItem(SKIP_KEY); } catch (_) {}
+    if (skipped) return false;
+    return survey.questions.length > 0 && survey.questions.some((q) => !survey.answers.has(q.id));
+  }
+
+  // How strongly the learner's answers point at each path.
+  function pathScores() {
+    const score = new Map();
+    if (!survey) return score;
+    for (const q of survey.questions) {
+      const opt = q.options.find((o) => o.id === survey.answers.get(q.id));
+      if (opt) for (const pid of opt.paths) score.set(pid, (score.get(pid) || 0) + 1);
+    }
+    return score;
   }
 
   const lessonsOf = (courseId) => catalog.lessons.filter((l) => l.course_id === courseId);
@@ -177,7 +327,7 @@
     const so = document.getElementById("signout");
     if (so) so.addEventListener("click", async () => {
       await sb.auth.signOut();
-      session = null; profile = null; catalog = null;
+      session = null; profile = null; catalog = null; survey = null;
       go("#/");
     });
     renderFooter();
@@ -454,13 +604,18 @@
 
   async function viewLearn() {
     await loadCatalog();
-    const done = await loadDone();
+    const [done] = await Promise.all([loadDone(), loadSurvey()]);
+    const scores = pathScores();
+    const paths = [...catalog.paths].sort((a, b) => (scores.get(b.id) || 0) - (scores.get(a.id) || 0) || a.sort - b.sort);
+    const topPath = scores.size && (scores.get(paths[0].id) || 0) > 0 ? paths[0] : null;
     if (!catalog.paths.length)
       return { html: `<section class="pad"><h1>No courses yet</h1><p>Add paths, courses, and lessons in the Supabase Table Editor, or run the sample content in <code>supabase/schema.sql</code>.</p></section>` };
 
-    const all = catalog.courses.map((c) => ({ course: c, st: courseStats(c, done) }));
+    const order = new Map(paths.map((p, i) => [p.id, i]));
+    const all = catalog.courses.map((c) => ({ course: c, st: courseStats(c, done) }))
+      .sort((a, b) => order.get(a.course.path_id) - order.get(b.course.path_id) || a.course.sort - b.course.sort);
     const open = all.filter((x) => !x.st.complete && x.st.next);
-    const pick = open.find((x) => x.st.done > 0) || open[0];   // a course already started wins
+    const pick = open.find((x) => x.st.done > 0) || open[0];   // a course already started wins, then the recommended path
     const upNext = pick ? { course: pick.course, lesson: pick.st.next, started: pick.st.done > 0 } : null;
 
     const first = (profile?.full_name || "").split(" ")[0];
@@ -473,10 +628,12 @@
             <span class="upnext-title">${esc(upNext.lesson.title)}</span>
             <span class="upnext-course">${esc(upNext.course.title)}</span></a>`
           : `<p class="notice">You have finished every course. Your certificates are on the <a href="#/certificates">certificates page</a>.</p>`}
+        ${topPath ? `<p class="reco">Recommended for you: <strong>${esc(topPath.title)}</strong>, based on your answers. <a href="#/welcome">Change your answers</a></p>`
+          : survey.questions.length && !profile?.is_admin ? `<p class="reco muted"><a href="#/welcome">Answer a few questions</a> and we will put the right path first.</p>` : ""}
         <div class="toolbar">
           <div class="chips" id="chips" role="group" aria-label="Filter by learning path">
             <button class="chip" type="button" data-path="" aria-pressed="true">All courses</button>
-            ${catalog.paths.map((p) => `<button class="chip" type="button" data-path="${p.id}" aria-pressed="false">${esc(p.title)}</button>`).join("")}
+            ${paths.map((p) => `<button class="chip" type="button" data-path="${p.id}" aria-pressed="false">${esc(p.title)}${topPath && p.id === topPath.id ? " ★" : ""}</button>`).join("")}
           </div>
           <label for="q" class="sr">Search courses</label>
           <input id="q" class="search" type="search" placeholder="Search courses" autocomplete="off">
@@ -517,7 +674,7 @@
         <div class="card-body">
           <span class="card-kind">Video, ${l.minutes} min</span>
           <h3><a href="#/lesson/${esc(l.slug)}">${esc(l.title)}</a></h3>
-          <p class="card-desc">${esc(course?.title || "")}</p>
+          <p class="card-desc">${esc(l.description || course?.title || "")}</p>
         </div></li>` };
     });
     return {
@@ -604,7 +761,9 @@
           <button class="btn btn-ghost" id="share" type="button">Share lesson</button>
         </div>
         <p class="muted">Lesson ${i + 1} of ${siblings.length}, ${lesson.kind === "video" ? "video" : "guide"}, about ${lesson.minutes} minutes</p>
+        ${lesson.description ? `<p class="lede">${esc(lesson.description)}</p>` : ""}
         ${videoEmbed(lesson.video_url)}
+        ${lesson.pdf_path ? `<div class="pdf-view" id="pdfview"><p class="muted pdf-status">Loading guide…</p></div>` : ""}
         <div class="prose">${md(lesson.body)}</div>
         <div class="complete-box" id="completebox">
           ${doneAt ? `<p class="done-note">Completed on ${fmtDate(doneAt)}</p>`
@@ -616,6 +775,12 @@
       </article>`,
       bind() {
         document.getElementById("share").addEventListener("click", () => share(lesson.title, `#/lesson/${lesson.slug}`));
+        const pv = document.getElementById("pdfview");
+        if (pv) {
+          signedPdfUrl(lesson.pdf_path).then((u) => mountPdfViewer(pv, u)).catch((err) => {
+            pv.innerHTML = `<p class="form-error">The guide could not be loaded. ${esc(err.message)}</p>`;
+          });
+        }
         const btn = document.getElementById("complete");
         if (!btn) return;
         btn.addEventListener("click", async () => {
@@ -640,16 +805,16 @@
 
   async function viewGuides() {
     await loadCatalog();
-    const { data, error } = await sb.from("lessons").select("id,slug,title,body,course_id,minutes").eq("kind", "guide").order("title");
+    const { data, error } = await sb.from("lessons").select("id,slug,title,body,description,pdf_text,pdf_path,course_id,minutes").eq("kind", "guide").order("title");
     if (error) throw error;
     const excerpt = (body) => String(body || "").replace(/[#*`>_\[\]]/g, "").replace(/\s+/g, " ").trim().slice(0, 160);
     const items = data.map((g) => {
       const course = catalog.courses.find((c) => c.id === g.course_id)?.title || "";
-      return { hay: (g.title + " " + g.body).toLowerCase(), html: `<li class="card">
+      return { hay: [g.title, g.description, g.body, g.pdf_text].join(" ").toLowerCase(), html: `<li class="card">
         <div class="card-body">
-          <span class="card-kind">Guide, ${g.minutes} min${course ? `, ${esc(course)}` : ""}</span>
+          <span class="card-kind">${g.pdf_path ? "PDF guide" : "Guide"}, ${g.minutes} min${course ? `, ${esc(course)}` : ""}</span>
           <h3><a href="#/lesson/${esc(g.slug)}">${esc(g.title)}</a></h3>
-          <p class="card-desc">${esc(excerpt(g.body))}</p>
+          <p class="card-desc">${esc(g.description || excerpt(g.body))}</p>
         </div></li>` };
     });
     return {
@@ -717,70 +882,6 @@
       },
     };
   }
-
-  async function viewAdmin() {
-    if (!profile?.is_admin)
-      return { html: `<section class="narrow pad"><h1>Administrators only</h1><p>Your account does not have admin access. The README explains how to grant it.</p></section>` };
-    const [{ data: rows, error }, { count }] = await Promise.all([
-      sb.rpc("admin_progress"),
-      sb.from("profiles").select("id", { count: "exact", head: true }),
-    ]);
-    if (error) throw error;
-    const courses = [...new Set(rows.map((r) => r.course_title))].sort();
-    const certified = rows.filter((r) => r.certificate_id).length;
-    let shown = rows;
-
-    const table = () => shown.length ? `
-      <div class="table-scroll"><table>
-        <thead><tr><th>Learner</th><th>Email</th><th>Course</th><th>Progress</th><th>Last activity</th><th>Completed</th></tr></thead>
-        <tbody>${shown.map((r) => `<tr>
-          <td>${esc(r.full_name || "(no name)")}</td><td>${esc(r.email)}</td><td>${esc(r.course_title)}</td>
-          <td>${r.lessons_done} of ${r.lessons_total}</td><td>${fmtDate(r.last_activity)}</td>
-          <td>${r.certified_at ? `<span class="pill">${fmtDate(r.certified_at)}</span>` : `<span class="muted">In progress</span>`}</td></tr>`).join("")}
-        </tbody></table></div>` : `<p class="muted">No learners match these filters.</p>`;
-
-    return {
-      html: `<section class="pad">
-        <div class="page-head"><h1>Learner progress</h1>
-          <div class="row"><a class="btn btn-ghost" href="#/manage">Edit content</a>
-          <button class="btn btn-ghost" id="csv" type="button">Download CSV</button></div></div>
-        <dl class="stats">
-          <div><dt>Registered learners</dt><dd>${count ?? "?"}</dd></div>
-          <div><dt>Courses started</dt><dd>${rows.length}</dd></div>
-          <div><dt>Courses completed</dt><dd>${certified}</dd></div>
-        </dl>
-        <div class="filters">
-          <div><label for="fq">Learner</label><input id="fq" type="search" placeholder="Name or email"></div>
-          <div><label for="fc">Course</label><select id="fc"><option value="">All courses</option>${courses.map((c) => `<option>${esc(c)}</option>`).join("")}</select></div>
-          <div><label for="fs">Status</label><select id="fs"><option value="">Any status</option><option value="done">Completed</option><option value="open">In progress</option></select></div>
-        </div>
-        <div id="tbl">${table()}</div>
-      </section>`,
-      bind() {
-        const fq = document.getElementById("fq"), fc = document.getElementById("fc"), fs = document.getElementById("fs");
-        const apply = () => {
-          const q = fq.value.trim().toLowerCase();
-          shown = rows.filter((r) =>
-            (!q || (r.full_name + " " + r.email).toLowerCase().includes(q)) &&
-            (!fc.value || r.course_title === fc.value) &&
-            (!fs.value || (fs.value === "done") === !!r.certificate_id));
-          document.getElementById("tbl").innerHTML = table();
-        };
-        [fq, fc, fs].forEach((el) => el.addEventListener("input", apply));
-        document.getElementById("csv").addEventListener("click", () => {
-          const cell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
-          const lines = [["Learner", "Email", "Course", "Lessons done", "Lessons total", "Last activity", "Completed on", "Certificate ID"]]
-            .concat(shown.map((r) => [r.full_name, r.email, r.course_title, r.lessons_done, r.lessons_total, r.last_activity, r.certified_at || "", r.certificate_id || ""]));
-          const blob = new Blob([lines.map((l) => l.map(cell).join(",")).join("\n")], { type: "text/csv" });
-          const a = document.createElement("a");
-          a.href = URL.createObjectURL(blob); a.download = "learner-progress.csv";
-          document.body.appendChild(a); a.click(); a.remove();
-          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-        });
-      },
-    };
-  }
-
 
   // ---------- views: content editor (admins) ----------
   const slugify = (t) => String(t || "").toLowerCase().normalize("NFKD").replace(/[^\w\s-]/g, "").trim().replace(/[\s_]+/g, "-").replace(/-+/g, "-").slice(0, 80);
@@ -867,7 +968,8 @@
             <button type="button" class="icon-btn" data-move="courses:${c.id}:-1" aria-label="Move up" ${i === 0 ? "disabled" : ""}>&#8593;</button>
             <button type="button" class="icon-btn" data-move="courses:${c.id}:1" aria-label="Move down" ${i === list.length - 1 ? "disabled" : ""}>&#8595;</button>
             <a class="btn btn-ghost btn-sm" href="#/manage/course/${c.id}">Edit course</a>
-            <a class="btn btn-primary btn-sm" href="#/manage/lesson/new?course=${c.id}">Add lesson</a>
+            <a class="btn btn-ghost btn-sm" href="#/manage/lesson/new?course=${c.id}&kind=guide">Add guide</a>
+            <a class="btn btn-primary btn-sm" href="#/manage/lesson/new?course=${c.id}">Add video</a>
           </span>
         </div>
         ${ls.length ? `<ol class="edit-list">${ls.map(lessonRow).join("")}</ol>` : `<p class="muted small edit-empty">No lessons yet.</p>`}
@@ -894,7 +996,8 @@
     return {
       html: `<section class="page-title">
         <div class="page-head"><h1>Content</h1>
-          <a class="btn btn-primary" href="#/manage/path/new">Add learning path</a></div>
+          <div class="row"><a class="btn btn-ghost" href="#/manage/survey">Starting survey</a>
+          <a class="btn btn-primary" href="#/manage/path/new">Add learning path</a></div></div>
         <p class="muted">Learning paths hold courses; courses hold lessons in order. Use the arrows to reorder. Changes go live as soon as you save.</p>
         ${paths.length ? paths.map(pathBlock).join("") : `<div class="empty">No content yet. Start by adding a learning path.</div>`}
       </section>`,
@@ -950,7 +1053,7 @@
   function parseSub(param) {
     const [kind, rest = ""] = param.split("/");
     const [idPart, qs = ""] = rest.split("?");
-    return { kind, id: idPart === "new" ? null : Number(idPart) || null, isNew: idPart === "new", q: new URLSearchParams(qs) };
+    return { kind, rest: idPart, id: idPart === "new" ? null : Number(idPart) || null, isNew: idPart === "new", q: new URLSearchParams(qs) };
   }
 
   async function viewManagePath(sub) {
@@ -1013,18 +1116,24 @@
     let row;
     if (sub.isNew) {
       const courseId = Number(sub.q.get("course")) || catalog.courses[0].id;
-      row = { course_id: courseId, title: "", slug: "", kind: "video", video_url: "", body: "", minutes: 5, sort: lessonsOf(courseId).length + 1 };
+      row = { course_id: courseId, title: "", slug: "", kind: sub.q.get("kind") === "guide" ? "guide" : "video", video_url: "", body: "", description: "", pdf_path: null, pdf_name: "", minutes: 5, sort: lessonsOf(courseId).length + 1 };
     } else {
       const { data, error } = await sb.from("lessons").select("*").eq("id", sub.id).maybeSingle();
       if (error) throw error;
       row = data;
     }
     if (!row) return notFound("lesson");
+    const isGuide = row.kind === "guide";
     const courseSelect = `<label for="course_id">Course</label><select id="course_id" name="course_id">
       ${catalog.courses.map((c) => `<option value="${c.id}" ${c.id === row.course_id ? "selected" : ""}>${esc(c.title)}</option>`).join("")}</select>`;
     const kindSelect = `<label for="kind">Lesson type</label><select id="kind" name="kind">
-      <option value="video" ${row.kind === "video" ? "selected" : ""}>Video lesson</option>
-      <option value="guide" ${row.kind === "guide" ? "selected" : ""}>Troubleshooting guide</option></select>`;
+      <option value="video" ${!isGuide ? "selected" : ""}>Video lesson</option>
+      <option value="guide" ${isGuide ? "selected" : ""}>Troubleshooting guide (PDF)</option></select>`;
+    const mdEditor = `
+      <div class="md-editor">
+        <div>${textarea("body", "Lesson text (Markdown: # heading, **bold**, - list, | table |)", row.body || "", 18, 'spellcheck="true"')}</div>
+        <div class="md-preview"><span class="md-preview-label">Preview</span><div class="prose" id="preview"></div></div>
+      </div>`;
     return {
       html: editShell({ crumb: sub.isNew ? "New lesson" : esc(row.title), title: sub.isNew ? "New lesson" : "Edit lesson", isNew: sub.isNew, deleteLabel: "Delete lesson",
         fields: `
@@ -1037,35 +1146,379 @@
             <div>${input("slug", "Link name (letters, numbers, and dashes)", row.slug, "text", 'required pattern="[a-z0-9-]+"')}</div>
             <div>${input("minutes", "Length in minutes", row.minutes, "number", 'min="1" max="600" required')}</div>
           </div>
-          <div id="videofield" ${row.kind === "video" ? "" : "hidden"}>${input("video_url", "Video link (YouTube link, or a direct .mp4 link)", row.video_url || "", "url")}</div>
-          <div class="md-editor">
-            <div>
-              ${textarea("body", "Lesson text (Markdown: # heading, **bold**, - list, | table |)", row.body, 18, 'spellcheck="true"')}
+          ${textarea("description", "Description (shown on the card and at the top of the lesson)", row.description || "", 2)}
+
+          <div id="videofields" ${isGuide ? "hidden" : ""}>
+            ${input("video_url", "Video link (YouTube link, or a direct .mp4 link)", row.video_url || "", "url")}
+            ${mdEditor.replace('id="body"', 'id="body"')}
+          </div>
+
+          <div id="guidefields" ${isGuide ? "" : "hidden"}>
+            <label for="pdf">PDF file</label>
+            <div class="file-box">
+              <input id="pdf" name="pdf" type="file" accept="application/pdf,.pdf">
+              <p class="muted small" id="pdfstatus">${row.pdf_path ? `Current file: <strong>${esc(row.pdf_name || "guide.pdf")}</strong>. Choose a new file to replace it.` : "No file yet. PDF only, up to 25 MB. Learners read it on the page and cannot download it."}</p>
+              ${row.pdf_path ? `<label class="check"><input type="checkbox" name="remove_pdf"> Remove the current PDF</label>` : ""}
             </div>
-            <div class="md-preview">
-              <span class="md-preview-label">Preview</span>
-              <div class="prose" id="preview"></div>
-            </div>
+            <details class="more" ${row.body && isGuide ? "open" : ""}>
+              <summary>Additional text under the PDF (optional)</summary>
+              ${mdEditor.replace('id="body" name="body"', 'id="body2" name="body2"').replace('for="body"', 'for="body2"').replace('id="preview"', 'id="preview2"')}
+            </details>
           </div>`,
       }),
       bind() {
         bindSlug();
-        const kind = document.getElementById("kind"), vf = document.getElementById("videofield");
-        kind.addEventListener("change", () => { vf.hidden = kind.value !== "video"; });
-        const body = document.getElementById("body"), prev = document.getElementById("preview");
-        const paint = () => { prev.innerHTML = body.value.trim() ? md(body.value) : `<p class="muted">Start typing on the left to see the lesson here.</p>`; };
-        body.addEventListener("input", paint); paint();
+        const kind = document.getElementById("kind"), vf = document.getElementById("videofields"), gf = document.getElementById("guidefields");
+        kind.addEventListener("change", () => { vf.hidden = kind.value === "guide"; gf.hidden = kind.value !== "guide"; });
+        const wire = (ta, pv) => {
+          const body = document.getElementById(ta), prev = document.getElementById(pv);
+          const paint = () => { prev.innerHTML = body.value.trim() ? md(body.value) : `<p class="muted">Start typing on the left to see it here.</p>`; };
+          body.addEventListener("input", paint); paint();
+        };
+        wire("body", "preview"); wire("body2", "preview2");
+        const pdf = document.getElementById("pdf"), status = document.getElementById("pdfstatus");
+        pdf.addEventListener("change", () => {
+          const f = pdf.files[0];
+          if (!f) return;
+          if (f.type !== "application/pdf" && !/\.pdf$/i.test(f.name)) { status.textContent = "That is not a PDF file."; pdf.value = ""; return; }
+          if (f.size > 25 * 1024 * 1024) { status.textContent = "That file is over 25 MB. Compress it or split it into two guides."; pdf.value = ""; return; }
+          status.textContent = `Ready to upload: ${f.name} (${(f.size / 1048576).toFixed(1)} MB)`;
+        });
+
         bindEditForm(async (v) => {
           if (!v.title.trim()) throw new Error("Enter a title.");
-          if (v.kind === "video" && !v.video_url.trim()) throw new Error("Add a video link, or change the lesson type to a guide.");
-          const id = await saveRow("lessons", sub.id, {
+          const guide = v.kind === "guide";
+          const file = guide ? pdf.files[0] : null;
+          const body = guide ? v.body2 : v.body;
+          if (!guide && !v.video_url.trim()) throw new Error("Add a video link, or change the lesson type to a guide.");
+          if (guide && !file && !row.pdf_path && !body.trim()) throw new Error("Upload a PDF or add some text.");
+          if (guide && v.remove_pdf && !file && !body.trim()) throw new Error("Removing the PDF leaves this guide empty. Upload a new file or add some text.");
+
+          const values = {
             course_id: Number(v.course_id), title: v.title.trim(), slug: slugify(v.slug) || slugify(v.title), kind: v.kind,
-            video_url: v.kind === "video" ? v.video_url.trim() : null, body: v.body, minutes: Math.max(1, Number(v.minutes) || 5), sort: row.sort,
-          });
+            description: v.description.trim(), video_url: guide ? null : v.video_url.trim(), body, minutes: Math.max(1, Number(v.minutes) || 5), sort: row.sort,
+          };
+          if (!guide || v.remove_pdf) { values.pdf_path = null; values.pdf_name = null; values.pdf_text = null; }
+
+          const btn = document.querySelector("#editform button[type=submit]");
+          const say = (t) => { btn.textContent = t; };
+          say("Saving…");
+          const id = await saveRow("lessons", sub.id, values);
+
+          if (file) {
+            say("Reading PDF…");
+            let text = "";
+            try { text = await extractPdfText(file); } catch (_) { /* scanned PDFs have no text layer; that is fine */ }
+            say("Uploading…");
+            const path = `lessons/${id}/${Date.now()}.pdf`;
+            const up = await sb.storage.from("guides").upload(path, file, { contentType: "application/pdf", upsert: false });
+            if (up.error) throw new Error("The PDF did not upload: " + up.error.message + ". The lesson was saved without it.");
+            const old = row.pdf_path;
+            await saveRow("lessons", id, { pdf_path: path, pdf_name: file.name, pdf_text: text });
+            if (old) sb.storage.from("guides").remove([old]);
+          } else if (guide && v.remove_pdf && row.pdf_path) {
+            sb.storage.from("guides").remove([row.pdf_path]);
+          }
           toast(sub.isNew ? "Lesson created" : "Saved");
-          go(sub.isNew ? `#/manage/lesson/${id}` : "#/manage");
+          go("#/manage");
         });
-        bindDelete(`Delete "${row.title}"? Learners who completed it lose that progress. This cannot be undone.`, () => deleteRow("lessons", sub.id));
+        bindDelete(`Delete "${row.title}"? Learners who completed it lose that progress. This cannot be undone.`, async () => {
+          if (row.pdf_path) await sb.storage.from("guides").remove([row.pdf_path]);
+          await deleteRow("lessons", sub.id);
+        });
+      },
+    };
+  }
+
+  // ---------- views: starting survey ----------
+  async function viewWelcome() {
+    await Promise.all([loadCatalog(), loadSurvey()]);
+    if (!survey.questions.length) { goAfterAuth(); return { html: "" }; }
+    const first = (profile?.full_name || "").split(" ")[0];
+    const hasAnswers = survey.answers.size > 0;
+    return {
+      html: `<section class="narrow pad survey">
+        <h1>${hasAnswers ? "Your answers" : first ? `Welcome, ${esc(first)}` : "Welcome"}</h1>
+        <p class="lede">${hasAnswers ? "Change anything below and we will reorder your courses." : "A few quick questions so we can put the right courses first. It takes under a minute."}</p>
+        <form id="surveyform" class="form" novalidate>
+          ${survey.questions.map((q, i) => `
+            <fieldset class="q">
+              <legend>${i + 1}. ${esc(q.prompt)}</legend>
+              ${q.help ? `<p class="muted small">${esc(q.help)}</p>` : ""}
+              ${q.options.map((o) => `<label class="opt"><input type="radio" name="q${q.id}" value="${o.id}" ${survey.answers.get(q.id) === o.id ? "checked" : ""} required> ${esc(o.label)}</label>`).join("")}
+            </fieldset>`).join("")}
+          <p class="form-error" id="formerr" role="alert" hidden></p>
+          <div class="row">
+            <button class="btn btn-primary" type="submit">${hasAnswers ? "Save answers" : "Show my courses"}</button>
+            ${hasAnswers ? `<a class="btn btn-ghost" href="#/learn">Cancel</a>` : `<button class="btn btn-ghost" type="button" id="skip">Skip for now</button>`}
+          </div>
+        </form>
+      </section>`,
+      bind() {
+        const form = document.getElementById("surveyform"), errEl = document.getElementById("formerr");
+        form.addEventListener("submit", async (e) => {
+          e.preventDefault();
+          const rows = survey.questions.map((q) => {
+            const v = form.querySelector(`input[name="q${q.id}"]:checked`);
+            return v ? { user_id: session.user.id, question_id: q.id, option_id: Number(v.value) } : null;
+          });
+          if (rows.some((r) => !r)) { errEl.textContent = "Answer every question, or skip for now."; errEl.hidden = false; return; }
+          const { error } = await sb.from("survey_answers").upsert(rows, { onConflict: "user_id,question_id" });
+          if (error) { errEl.textContent = error.message; errEl.hidden = false; return; }
+          survey = null;
+          toast("Answers saved");
+          if (hasAnswers) go("#/learn"); else goAfterAuth();
+        });
+        const skip = document.getElementById("skip");
+        if (skip) skip.addEventListener("click", () => { try { sessionStorage.setItem(SKIP_KEY, "1"); } catch (_) {} goAfterAuth(); });
+      },
+    };
+  }
+
+  // ---------- views: admin learners ----------
+  async function viewAdmin() {
+    if (!profile?.is_admin) return adminOnly();
+    const LIMIT = 25;
+    const load = async (q, page) => {
+      const { data, error } = await sb.rpc("admin_learners", { p_q: q, p_offset: (page - 1) * LIMIT, p_limit: LIMIT });
+      if (error) throw error;
+      return data;
+    };
+    const first = await load("", 1);
+    const total = first.length ? Number(first[0].total_count) : 0;
+
+    const table = (rows, page, count) => {
+      const pages = Math.max(1, Math.ceil(count / LIMIT));
+      const pager = pages > 1 ? `<nav class="pager" aria-label="Pages">
+          <button type="button" data-page="${page - 1}" ${page <= 1 ? "disabled" : ""}>‹</button>
+          <span class="muted small pager-info">Page ${page} of ${pages}</span>
+          <button type="button" data-page="${page + 1}" ${page >= pages ? "disabled" : ""}>›</button></nav>` : "";
+      if (!rows.length) return `<div class="empty">No learners match.</div>`;
+      return `<div class="table-scroll"><table class="learners">
+        <thead><tr><th>Learner</th><th>Email</th><th>Joined</th><th>Lessons done</th><th>Certificates</th><th>Last activity</th><th>Role</th></tr></thead>
+        <tbody>${rows.map((r) => `<tr data-id="${r.id}" tabindex="0">
+          <td><a href="#/admin/learner/${r.id}">${esc(r.full_name || "(no name)")}</a></td><td>${esc(r.email)}</td>
+          <td>${fmtDate(r.created_at)}</td><td>${r.lessons_done}</td><td>${r.certificates}</td>
+          <td>${r.last_activity ? fmtDate(r.last_activity) : `<span class="muted">Not started</span>`}</td>
+          <td>${r.is_admin ? `<span class="pill">Admin</span>` : `<span class="muted">Learner</span>`}</td></tr>`).join("")}
+        </tbody></table></div>${pager}`;
+    };
+
+    return {
+      html: `<section class="page-title">
+        <div class="page-head"><h1>Learners</h1>
+          <div class="row"><a class="btn btn-ghost" href="#/manage">Edit content</a>
+          <button class="btn btn-ghost" id="csv" type="button">Download progress CSV</button></div></div>
+        <div class="toolbar">
+          <p class="muted" style="margin:0" id="count">${total} registered learner${total === 1 ? "" : "s"}. Click a name for their progress and admin access.</p>
+          <label for="q" class="sr">Search learners</label>
+          <input id="q" class="search" type="search" placeholder="Search by name or email" autocomplete="off">
+        </div>
+        <div id="tbl">${table(first, 1, total)}</div>
+      </section>`,
+      bind() {
+        let q = "", page = 1, t;
+        const tbl = document.getElementById("tbl");
+        const paint = async () => {
+          tbl.innerHTML = `<p class="muted">Loading…</p>`;
+          try { const rows = await load(q, page); tbl.innerHTML = table(rows, page, rows.length ? Number(rows[0].total_count) : 0); }
+          catch (err) { tbl.innerHTML = `<p class="form-error">${esc(err.message)}</p>`; }
+        };
+        document.getElementById("q").addEventListener("input", (e) => { clearTimeout(t); t = setTimeout(() => { q = e.target.value.trim(); page = 1; paint(); }, 250); });
+        tbl.addEventListener("click", (e) => {
+          const b = e.target.closest("[data-page]");
+          if (b && !b.disabled) { page = Number(b.dataset.page); paint(); return; }
+          const tr = e.target.closest("tr[data-id]");
+          if (tr && !e.target.closest("a")) go(`#/admin/learner/${tr.dataset.id}`);
+        });
+        tbl.addEventListener("keydown", (e) => { const tr = e.target.closest("tr[data-id]"); if (tr && e.key === "Enter") go(`#/admin/learner/${tr.dataset.id}`); });
+        document.getElementById("csv").addEventListener("click", async () => {
+          const { data: rows, error } = await sb.rpc("admin_progress");
+          if (error) { toast(error.message); return; }
+          const cell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+          const lines = [["Learner", "Email", "Course", "Lessons done", "Lessons total", "Last activity", "Completed on", "Certificate ID"]]
+            .concat(rows.map((r) => [r.full_name, r.email, r.course_title, r.lessons_done, r.lessons_total, r.last_activity, r.certified_at || "", r.certificate_id || ""]));
+          const blob = new Blob([lines.map((l) => l.map(cell).join(",")).join("\n")], { type: "text/csv" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob); a.download = "learner-progress.csv";
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        });
+      },
+    };
+  }
+
+  async function viewAdminLearner(id) {
+    if (!profile?.is_admin) return adminOnly();
+    if (!/^[0-9a-f-]{36}$/i.test(id)) return notFound("learner");
+    const [{ data: p, error: e1 }, { data: courses, error: e2 }, { data: answers }, { data: qs }, { data: os }] = await Promise.all([
+      sb.from("profiles").select("*").eq("id", id).maybeSingle(),
+      sb.rpc("admin_learner_courses", { p_user_id: id }),
+      sb.from("survey_answers").select("question_id,option_id,answered_at").eq("user_id", id),
+      sb.from("survey_questions").select("id,prompt,sort").order("sort"),
+      sb.from("survey_options").select("id,label"),
+    ]);
+    if (e1 || e2) throw e1 || e2;
+    if (!p) return notFound("learner");
+    const me = p.id === session.user.id;
+    const started = courses.filter((c) => c.lessons_done > 0);
+    const ans = (answers || []).map((a) => ({ q: (qs || []).find((x) => x.id === a.question_id), o: (os || []).find((x) => x.id === a.option_id), at: a.answered_at })).filter((x) => x.q && x.o);
+    return {
+      html: `<section class="pad">
+        <p class="crumb"><a href="#/admin">Learners</a> / ${esc(p.full_name || p.email)}</p>
+        <div class="page-head">
+          <div><h1>${esc(p.full_name || "(no name)")}</h1>
+            <p class="muted">${esc(p.email)}, joined ${fmtDate(p.created_at)}${p.is_admin ? `, <span class="pill">Admin</span>` : ""}</p></div>
+          ${me ? `<p class="muted small">This is you. Another admin can change your access.</p>`
+               : `<button class="btn ${p.is_admin ? "btn-danger" : "btn-primary"}" id="toggleadmin" type="button">${p.is_admin ? "Remove admin access" : "Make admin"}</button>`}
+        </div>
+        <dl class="stats">
+          <div><dt>Lessons done</dt><dd>${courses.reduce((a, c) => a + c.lessons_done, 0)}</dd></div>
+          <div><dt>Courses started</dt><dd>${started.length}</dd></div>
+          <div><dt>Certificates</dt><dd>${courses.filter((c) => c.certified_at).length}</dd></div>
+        </dl>
+        <h2>Course progress</h2>
+        ${started.length ? `<div class="table-scroll"><table>
+          <thead><tr><th>Course</th><th>Path</th><th>Progress</th><th>Last activity</th><th>Completed</th></tr></thead>
+          <tbody>${started.map((c) => `<tr><td>${esc(c.course_title)}</td><td>${esc(c.path_title)}</td>
+            <td>${c.lessons_done} of ${c.lessons_total}</td><td>${c.last_activity ? fmtDate(c.last_activity) : ""}</td>
+            <td>${c.certified_at ? `<span class="pill">${fmtDate(c.certified_at)}</span>` : `<span class="muted">In progress</span>`}</td></tr>`).join("")}
+          </tbody></table></div>` : `<p class="muted">Has not started a course yet.</p>`}
+        <h2 style="margin-top:32px">Starting survey</h2>
+        ${ans.length ? `<dl class="answers">${ans.map((a) => `<div><dt>${esc(a.q.prompt)}</dt><dd>${esc(a.o.label)}</dd></div>`).join("")}</dl>
+            <p class="muted small">Answered ${fmtDate(ans[0].at)}</p>`
+          : `<p class="muted">${qs && qs.length ? "Has not answered the survey." : "No survey questions have been set up yet."}</p>`}
+      </section>`,
+      bind() {
+        const b = document.getElementById("toggleadmin");
+        if (!b) return;
+        b.addEventListener("click", async () => {
+          const making = !p.is_admin;
+          if (!window.confirm(making ? `Give ${p.full_name || p.email} admin access? Admins can edit all content and see every learner.` : `Remove admin access from ${p.full_name || p.email}?`)) return;
+          b.disabled = true;
+          const { error } = await sb.rpc("set_admin", { p_user_id: p.id, p_is_admin: making });
+          if (error) { toast(error.message); b.disabled = false; return; }
+          toast(making ? "Admin access granted" : "Admin access removed");
+          render();
+        });
+      },
+    };
+  }
+
+  // ---------- views: survey editor (admins) ----------
+  async function loadSurveyAdmin() {
+    const [qs, os, ops] = await Promise.all([
+      sb.from("survey_questions").select("*").order("sort"),
+      sb.from("survey_options").select("*").order("sort"),
+      sb.from("survey_option_paths").select("*"),
+    ]);
+    const err = qs.error || os.error || ops.error;
+    if (err) throw err;
+    return qs.data.map((q) => ({ ...q, options: os.data.filter((o) => o.question_id === q.id)
+      .map((o) => ({ ...o, paths: ops.data.filter((x) => x.option_id === o.id).map((x) => x.path_id) })) }));
+  }
+
+  async function viewManageSurvey() {
+    if (!profile?.is_admin) return adminOnly();
+    await loadCatalog();
+    const qs = await loadSurveyAdmin();
+    const pathName = (id) => catalog.paths.find((p) => p.id === id)?.title || "(deleted path)";
+    return {
+      html: `<section class="page-title">
+        <p class="crumb"><a href="#/manage">Content</a> / Starting survey</p>
+        <div class="page-head"><h1>Starting survey</h1>
+          <a class="btn btn-primary" href="#/manage/survey/new">Add question</a></div>
+        <p class="muted">New learners answer these once after signing up. Each answer points at the learning paths it fits; the paths with the most matches appear first on that learner's Courses page.</p>
+        ${qs.length ? qs.map((q, i) => `
+          <div class="edit-course ${q.active ? "" : "is-off"}">
+            <div class="edit-head">
+              <div><h3><a href="#/manage/survey/${q.id}">${esc(q.prompt)}</a></h3>
+                <span class="muted small">${q.options.length} answer${q.options.length === 1 ? "" : "s"}${q.active ? "" : ", hidden from learners"}</span></div>
+              <span class="edit-actions">
+                <button type="button" class="icon-btn" data-move="survey_questions:${q.id}:-1" aria-label="Move up" ${i === 0 ? "disabled" : ""}>&#8593;</button>
+                <button type="button" class="icon-btn" data-move="survey_questions:${q.id}:1" aria-label="Move down" ${i === qs.length - 1 ? "disabled" : ""}>&#8595;</button>
+                <a class="btn btn-ghost btn-sm" href="#/manage/survey/${q.id}">Edit</a>
+              </span>
+            </div>
+            <ol class="edit-list">${q.options.map((o) => `<li class="edit-row opt-view">
+              <span class="edit-title">${esc(o.label)}</span>
+              <span class="muted small">${o.paths.length ? "→ " + o.paths.map(pathName).map(esc).join(", ") : "points at no path"}</span></li>`).join("")}</ol>
+          </div>`).join("") : `<div class="empty">No questions yet. Add the first one.</div>`}
+      </section>`,
+      bind() {
+        app.querySelector(".page-title").addEventListener("click", async (e) => {
+          const b = e.target.closest("[data-move]");
+          if (!b || b.disabled) return;
+          const [, id, dir] = b.dataset.move.split(":");
+          const i = qs.findIndex((x) => x.id === Number(id));
+          try { await moveRow("survey_questions", qs, i, Number(dir)); survey = null; render(); }
+          catch (err) { toast(err.message); }
+        });
+      },
+    };
+  }
+
+  async function viewManageSurveyQuestion(sub) {
+    if (!profile?.is_admin) return adminOnly();
+    await loadCatalog();
+    const qs = await loadSurveyAdmin();
+    const row = sub.isNew ? { prompt: "", help: "", active: true, sort: qs.length + 1, options: [] } : qs.find((q) => q.id === sub.id);
+    if (!row) return notFound("question");
+    let nextTmp = -1;
+    const optRow = (o) => `
+      <li class="opt-row" data-oid="${o.id}">
+        <div class="opt-main">
+          <input type="text" class="opt-label" value="${esc(o.label)}" placeholder="Answer text" aria-label="Answer text" required>
+          <button type="button" class="icon-btn opt-del" aria-label="Remove answer">&times;</button>
+        </div>
+        <div class="opt-paths">
+          ${catalog.paths.length ? catalog.paths.map((p) => `<label class="check"><input type="checkbox" value="${p.id}" ${o.paths.includes(p.id) ? "checked" : ""}> ${esc(p.title)}</label>`).join("")
+            : `<span class="muted small">Add learning paths first, then come back to link answers to them.</span>`}
+        </div>
+      </li>`;
+    return {
+      html: editShell({ crumb: `<a href="#/manage/survey">Starting survey</a> / ${sub.isNew ? "New question" : esc(row.prompt)}`, title: sub.isNew ? "New question" : "Edit question", isNew: sub.isNew, deleteLabel: "Delete question",
+        fields: `
+          ${input("prompt", "Question", row.prompt, "text", "required")}
+          ${input("help", "Help text under the question (optional)", row.help, "text")}
+          <label class="check"><input type="checkbox" name="active" ${row.active ? "checked" : ""}> Show this question to new learners</label>
+          <label style="margin-top:22px">Answers, and the learning paths each one points at</label>
+          <ol class="opt-list" id="opts">${row.options.map(optRow).join("")}</ol>
+          <button type="button" class="btn btn-ghost btn-sm" id="addopt" style="justify-self:start;margin-top:8px">Add answer</button>` }),
+      bind() {
+        const list = document.getElementById("opts");
+        document.getElementById("addopt").addEventListener("click", () => {
+          list.insertAdjacentHTML("beforeend", optRow({ id: nextTmp--, label: "", paths: [] }));
+          list.lastElementChild.querySelector(".opt-label").focus();
+        });
+        list.addEventListener("click", (e) => { const d = e.target.closest(".opt-del"); if (d) d.closest(".opt-row").remove(); });
+        bindEditForm(async (v) => {
+          if (!v.prompt.trim()) throw new Error("Enter the question.");
+          const rows = [...list.querySelectorAll(".opt-row")].map((li, i) => ({
+            id: Number(li.dataset.oid), label: li.querySelector(".opt-label").value.trim(), sort: i + 1,
+            paths: [...li.querySelectorAll("input[type=checkbox]:checked")].map((c) => Number(c.value)),
+          }));
+          if (rows.length < 2) throw new Error("Add at least two answers.");
+          if (rows.some((r) => !r.label)) throw new Error("Every answer needs text.");
+
+          const qid = await saveRow("survey_questions", sub.id, { prompt: v.prompt.trim(), help: v.help.trim(), active: !!v.active, sort: row.sort });
+          const keep = rows.filter((r) => r.id > 0).map((r) => r.id);
+          const gone = row.options.filter((o) => !keep.includes(o.id)).map((o) => o.id);
+          if (gone.length) { const { error } = await sb.from("survey_options").delete().in("id", gone); if (error) throw new Error(error.message); }
+          for (const r of rows) {
+            const oid = await saveRow("survey_options", r.id > 0 ? r.id : null, { question_id: qid, label: r.label, sort: r.sort });
+            const d = await sb.from("survey_option_paths").delete().eq("option_id", oid);
+            if (d.error) throw new Error(d.error.message);
+            if (r.paths.length) {
+              const ins = await sb.from("survey_option_paths").insert(r.paths.map((pid) => ({ option_id: oid, path_id: pid })));
+              if (ins.error) throw new Error(ins.error.message);
+            }
+          }
+          survey = null;
+          toast(sub.isNew ? "Question added" : "Saved");
+          go("#/manage/survey");
+        });
+        bindDelete(`Delete this question? Learners' answers to it are removed too.`, async () => { await deleteRow("survey_questions", sub.id); survey = null; });
       },
     };
   }
@@ -1091,6 +1544,10 @@
       return;
     }
     if (session && ["", "login", "signup"].includes(r.name)) { goAfterAuth(); return; }
+    if (session && !["welcome", "verify", "new-password"].includes(r.name)) {
+      try { await loadSurvey(); } catch (_) { survey = { questions: [], answers: new Map() }; }
+      if (surveyPending()) { go("#/welcome"); return; }
+    }
 
     try {
       let v;
@@ -1107,12 +1564,19 @@
         case "guides": v = await viewGuides(); break;
         case "videos": v = await viewVideos(); break;
         case "certificates": v = await viewCertificates(); break;
-        case "admin": v = await viewAdmin(); break;
+        case "admin": {
+          const sub = parseSub(r.param);
+          v = sub.kind === "learner" ? await viewAdminLearner(sub.rest) : await viewAdmin();
+          break;
+        }
+        case "welcome": v = await viewWelcome(); break;
         case "manage": {
           const sub = parseSub(r.param);
           v = sub.kind === "path" ? await viewManagePath(sub)
             : sub.kind === "course" ? await viewManageCourse(sub)
             : sub.kind === "lesson" ? await viewManageLesson(sub)
+            : sub.kind === "survey" && sub.rest ? await viewManageSurveyQuestion(sub)
+            : sub.kind === "survey" ? await viewManageSurvey()
             : await viewManage();
           break;
         }
@@ -1143,7 +1607,7 @@
       const hadSession = !!session;
       session = s;
       // Never call Supabase from inside this callback; defer instead.
-      if (event === "SIGNED_OUT" && hadSession) setTimeout(() => { profile = null; catalog = null; go("#/"); }, 0);
+      if (event === "SIGNED_OUT" && hadSession) setTimeout(() => { profile = null; catalog = null; survey = null; go("#/"); }, 0);
     });
 
     const { data } = await sb.auth.getSession();   // also finishes handling email-link tokens in the URL
@@ -1168,4 +1632,5 @@
 
   start();
 })();
+
 
