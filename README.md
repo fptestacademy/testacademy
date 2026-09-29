@@ -1,4 +1,4 @@
- Fieldbook Training
+# Fieldbook Training
 
 A training site with accounts, learning paths, video lessons, troubleshooting guides, certificates, and an admin report of who has completed what. It runs free on GitHub Pages plus a free Supabase project. There is no build step: plain HTML, CSS, and JavaScript.
 
@@ -23,10 +23,11 @@ A training site with accounts, learning paths, video lessons, troubleshooting gu
 | Courses | Card grid of every course, filter chips per learning path, search, and pagination |
 | Video Library | Every video lesson as a card with its thumbnail |
 | Resource Library | Every troubleshooting guide as a card, searchable by symptom or part |
-| Quizzes | Each course can have an end-of-course quiz that unlocks when every lesson is done. Six question types: multiple choice, true/false, select all that apply, slider (exact value or range), pin on a picture, and put in order. Each question can link a troubleshooting guide for help. Grading happens in the database, so answer keys never reach the browser. The course certificate is issued only after a pass |
-| Master exams | Each learning path can have a master exam that unlocks once every course quiz in the path is passed. Passing it issues a learning path certificate |
-| Certificates | Course and learning path certificates, with verification links |
-| Learners (admins) | Searchable, paged list of every learner. Click one for their course progress and survey answers, and to grant or remove admin access. CSV export of all progress |
+| Learning path ladder | Paths are a ladder in the order shown on the Content page. The starting survey places each learner on a rung; every path below it is waived (its courses count as done and its master exam is open straight away). Within a path, courses unlock in order: each opens when the previous one is complete (lessons done and quiz passed). The home screen shows progress in the learner's current path |
+| Quizzes | Each course can have an end-of-course quiz that unlocks when every lesson is done. Six question types: multiple choice, true/false, select all that apply, slider (exact value or range), pin on a picture, and put in order. Each question can link a troubleshooting guide for help. Grading happens in the database, so answer keys never reach the browser. Passing it marks the course complete and unlocks the next course |
+| Master exams | Each learning path can have a master exam that unlocks once every course in the path is complete (or the path is waived). Passing it issues the learning path certificate, the only kind of certificate |
+| Certificates | Learning path certificates, with verification links |
+| Learners (admins) | Searchable, paged list of every learner: lessons done, quizzes passed, exams passed, average quiz and exam scores, last activity, role. Click one for course progress, quiz attempts, and survey answers, and to grant or remove admin access. CSV export of all progress |
 | Starting survey | New learners answer a short survey after signing up. Admins write the questions under Content → Starting survey and tick which learning paths each answer points at; the learner's Courses page then puts the best-matching path first, marked "Recommended for you" |
 | Content (admins) | Add, edit, reorder, and delete learning paths, courses, and lessons without opening Supabase. Video lessons use Markdown with a live preview; troubleshooting guides are a title, a description, and a PDF upload |
 
