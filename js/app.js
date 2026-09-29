@@ -1543,8 +1543,9 @@
             submit.disabled = true; submit.textContent = "Marking…";
             const { data, error } = await sb.rpc("submit_quiz", { p_quiz_id: qid, p_answers: answers });
             if (error) { toast(error.message); submit.disabled = false; submit.textContent = "Submit"; return; }
+             if (!data) { toast("No result came back. Try again."); submit.disabled = false; submit.textContent = "Submit"; return; }
             result = data; quizzes = null;
-            if (result.passed && course) await sb.rpc("issue_certificate", { p_course_id: course.id }).catch(() => {});
+            if (result.passed && course) { try { await sb.rpc("issue_certificate", { p_course_id: course.id }); } catch (_) {} }
             paint();
           });
         };
