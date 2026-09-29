@@ -259,7 +259,7 @@
 
   async function loadMyCerts() {
     const { data, error } = await sb.from("certificates")
-      .select("id,course_id,path_id,issued_at").eq("user_id", session.user.id).order("issued_at", { ascending: false });
+      .select("id,course_id,path_id,issued_at").eq("user_id", session.user.id).not("path_id", "is", null).order("issued_at", { ascending: false });
     if (error) throw error;
     return data;
   }
@@ -297,6 +297,41 @@
       if (opt) for (const pid of opt.paths) score.set(pid, (score.get(pid) || 0) + 1);
     }
     return score;
+  }
+
+  // The ladder: paths in order, the learner's starting rung, waived rungs, course locks.
+  const ladder = () => [...catalog.paths].sort((a, b) => a.sort - b.sort || a.id - b.id);
+  const startPath = () => catalog.paths.find((p) => p.id === profile?.start_path_id) || ladder()[0] || null;
+  const rung = (p) => ladder().findIndex((x) => x.id === p.id);
+  const isWaived = (path) => { const sp = startPath(); return !!(sp && path && rung(path) < rung(sp)); };
+  const courseComplete = (c, done) => { const st = courseStats(c, done); const q = quizForCourse(c.id); return st.complete && (!q || q.passed); };
+  // Courses in a path unlock in order: the first is open, each next one opens when the previous is complete.
+  function courseState(c, done) {
+    const path = catalog.paths.find((p) => p.id === c.path_id);
+    if (path && isWaived(path)) return { locked: false, waived: true, complete: true };
+    const cs = catalog.courses.filter((x) => x.path_id === c.path_id).sort((a, b) => a.sort - b.sort || a.id - b.id);
+    const i = cs.findIndex((x) => x.id === c.id);
+    const prev = cs[i - 1];
+    return { locked: !!prev && !courseComplete(prev, done), waived: false, complete: courseComplete(c, done) };
+  }
+  function pathProgress(path, done) {
+    const cs = catalog.courses.filter((x) => x.path_id === path.id).sort((a, b) => a.sort - b.sort || a.id - b.id);
+    const waived = isWaived(path);
+    const doneCourses = waived ? cs.length : cs.filter((c) => courseComplete(c, done)).length;
+    const quizzesTotal = cs.filter((c) => quizForCourse(c.id)).length;
+    const quizzesPassed = waived ? quizzesTotal : cs.filter((c) => quizForCourse(c.id)?.passed).length;
+    const lessonsTotal = cs.reduce((a, c) => a + lessonsOf(c.id).length, 0);
+    const lessonsDone = waived ? lessonsTotal : cs.reduce((a, c) => a + courseStats(c, done).done, 0);
+    const exam = examForPath(path.id);
+    const examReady = waived || (cs.length > 0 && doneCourses === cs.length);
+    const next = waived ? null : cs.find((c) => !courseComplete(c, done));
+    return { cs, waived, doneCourses, quizzesTotal, quizzesPassed, lessonsTotal, lessonsDone, exam, examReady, next,
+      finished: exam ? exam.passed : (cs.length > 0 && doneCourses === cs.length) };
+  }
+  // The rung the learner is working on: the first path from their start upward that is not finished.
+  function currentPath(done) {
+    const l = ladder(); const sp = startPath(); if (!sp) return null;
+    return l.slice(rung(sp)).find((p) => !pathProgress(p, done).finished) || sp;
   }
 
   const lessonsOf = (courseId) => catalog.lessons.filter((l) => l.course_id === courseId);
@@ -619,19 +654,19 @@
     return { paint, setQuery: (v) => { q = v; page = 1; paint(); }, reset: () => { page = 1; paint(); } };
   }
 
-  function courseCard(c, st) {
-    const pct = st.total ? Math.round((st.done / st.total) * 100) : 0;
-    const label = st.complete ? "Review" : st.done ? "Continue" : "Start";
+  function courseCard(c, st, state = { locked: false, waived: false, complete: st.complete }) {
+    const pct = state.waived ? 100 : st.total ? Math.round((st.done / st.total) * 100) : 0;
+    const label = state.locked ? "Locked" : state.complete ? "Review" : st.done ? "Continue" : "Start";
     const thumb = c.image_url ? `<img src="${esc(c.image_url)}" alt="" loading="lazy">` : "";
-    return `<li class="card ${st.complete ? "is-complete" : ""}">
+    return `<li class="card ${state.complete ? "is-complete" : ""} ${state.locked ? "is-locked" : ""}">
       <a class="thumb ${c.image_url ? "" : "thumb-plain"}" href="#/course/${esc(c.slug)}" tabindex="-1" aria-hidden="true">${thumb}</a>
       <div class="card-body">
-        <span class="card-kind">Course, ${st.total} lessons, about ${st.minutes} min</span>
+        <span class="card-kind">${state.waived ? "Waived, " : state.locked ? "Locked, " : ""}${st.total} lessons, about ${st.minutes} min</span>
         <h3><a href="#/course/${esc(c.slug)}">${esc(c.title)}</a></h3>
         <p class="card-desc">${esc(c.description)}</p>
         <div class="card-foot">
           <div class="bar" role="img" aria-label="${st.done} of ${st.total} lessons complete"><span style="width:${pct}%"></span></div>
-          <a class="btn btn-sm ${st.complete ? "btn-ghost" : "btn-primary"}" href="#/course/${esc(c.slug)}">${label}</a>
+          <a class="btn btn-sm ${state.complete || state.locked ? "btn-ghost" : "btn-primary"}" href="#/course/${esc(c.slug)}">${label}</a>
         </div>
       </div></li>`;
   }
@@ -639,35 +674,50 @@
   async function viewLearn() {
     await loadCatalog();
     const [done] = await Promise.all([loadDone(), loadSurvey(), loadQuizzes()]);
-    const scores = pathScores();
-    const paths = [...catalog.paths].sort((a, b) => (scores.get(b.id) || 0) - (scores.get(a.id) || 0) || a.sort - b.sort);
-    const topPath = scores.size && (scores.get(paths[0].id) || 0) > 0 ? paths[0] : null;
     if (!catalog.paths.length)
-      return { html: `<section class="pad"><h1>No courses yet</h1><p>Add paths, courses, and lessons in the Supabase Table Editor, or run the sample content in <code>supabase/schema.sql</code>.</p></section>` };
-
-    const order = new Map(paths.map((p, i) => [p.id, i]));
-    const all = catalog.courses.map((c) => ({ course: c, st: courseStats(c, done) }))
-      .sort((a, b) => order.get(a.course.path_id) - order.get(b.course.path_id) || a.course.sort - b.course.sort);
-    const open = all.filter((x) => !x.st.complete && x.st.next);
-    const pick = open.find((x) => x.st.done > 0) || open[0];   // a course already started wins, then the recommended path
-    const upNext = pick ? { course: pick.course, lesson: pick.st.next, started: pick.st.done > 0 } : null;
-
+      return { html: `<section class="pad"><h1>No courses yet</h1><p>Add paths, courses, and lessons under Content.</p></section>` };
+    const paths = ladder();
+    const cur = currentPath(done);
+    const prog = cur ? pathProgress(cur, done) : null;
+    const nextLesson = prog && prog.next ? courseStats(prog.next, done).next : null;
     const first = (profile?.full_name || "").split(" ")[0];
+    const pct = prog && prog.cs.length ? Math.round(100 * prog.doneCourses / prog.cs.length) : 0;
+    const order = new Map(paths.map((p, i) => [p.id, i]));
+    const all = catalog.courses.map((c) => ({ course: c, st: courseStats(c, done), state: courseState(c, done) }))
+      .sort((a, b) => order.get(a.course.path_id) - order.get(b.course.path_id) || a.course.sort - b.course.sort);
+
+    const hero = cur ? `
+      <div class="path-hero">
+        <div class="path-hero-main">
+          <span class="upnext-label">${prog.waived ? "Waived path" : "Your learning path"}</span>
+          <span class="path-hero-title">${esc(cur.title)}</span>
+          <div class="path-meter"><span style="width:${pct}%"></span></div>
+          <div class="path-facts">
+            <span><strong>${prog.doneCourses}</strong> of ${prog.cs.length} courses</span>
+            <span><strong>${prog.lessonsDone}</strong> of ${prog.lessonsTotal} lessons</span>
+            ${prog.quizzesTotal ? `<span><strong>${prog.quizzesPassed}</strong> of ${prog.quizzesTotal} quizzes passed</span>` : ""}
+            ${prog.exam ? `<span>Master exam: <strong>${prog.exam.passed ? "passed" : prog.examReady ? "ready" : "locked"}</strong></span>` : ""}
+          </div>
+        </div>
+        <div class="path-hero-cta">
+          ${prog.finished ? `<a class="btn btn-accent" href="#/certificates">Your certificate</a>`
+            : prog.exam && prog.examReady ? `<a class="btn btn-accent" href="#/quiz/${prog.exam.id}">${prog.exam.attempts ? "Retake the master exam" : "Take the master exam"}</a>`
+            : nextLesson ? `<a class="btn btn-accent" href="#/lesson/${esc(nextLesson.slug)}">${courseStats(prog.next, done).done ? "Continue" : "Start"}: ${esc(nextLesson.title)}</a>`
+            : prog.next && quizForCourse(prog.next.id) ? `<a class="btn btn-accent" href="#/quiz/${quizForCourse(prog.next.id).id}">Take the quiz: ${esc(prog.next.title)}</a>`
+            : ""}
+          ${survey.questions.length && !profile?.is_admin ? `<a class="small path-hero-link" href="#/welcome">Change your survey answers</a>` : ""}
+        </div>
+      </div>` : "";
+
     return {
       html: `
       <section class="page-title">
         <h1>${first ? `Welcome back, ${esc(first)}` : "Courses"}</h1>
-        ${upNext ? `<a class="upnext" href="#/lesson/${esc(upNext.lesson.slug)}">
-            <span class="upnext-label">${upNext.started ? "Continue where you stopped" : "Start here"}</span>
-            <span class="upnext-title">${esc(upNext.lesson.title)}</span>
-            <span class="upnext-course">${esc(upNext.course.title)}</span></a>`
-          : `<p class="notice">You have finished every course. Your certificates are on the <a href="#/certificates">certificates page</a>.</p>`}
-        ${topPath ? `<p class="reco">Recommended for you: <strong>${esc(topPath.title)}</strong>, based on your answers. <a href="#/welcome">Change your answers</a></p>`
-          : survey.questions.length && !profile?.is_admin ? `<p class="reco muted"><a href="#/welcome">Answer a few questions</a> and we will put the right path first.</p>` : ""}
+        ${hero}
         <div class="toolbar">
           <div class="chips" id="chips" role="group" aria-label="Filter by learning path">
             <button class="chip" type="button" data-path="" aria-pressed="true">All courses</button>
-            ${paths.map((p) => `<button class="chip" type="button" data-path="${p.id}" aria-pressed="false">${esc(p.title)}${topPath && p.id === topPath.id ? " ★" : ""}</button>`).join("")}
+            ${paths.map((p) => `<button class="chip ${cur && p.id === cur.id ? "chip-current" : ""}" type="button" data-path="${p.id}" aria-pressed="false">${esc(p.title)}${isWaived(p) ? " ✓" : ""}</button>`).join("")}
           </div>
           <label for="q" class="sr">Search courses</label>
           <input id="q" class="search" type="search" placeholder="Search courses" autocomplete="off">
@@ -675,19 +725,17 @@
         <div id="grid"></div>
         ${paths.some((p) => examForPath(p.id)) ? `
           <h2 class="exams-head">Master exams</h2>
-          <p class="muted">Pass every course quiz in a learning path to unlock its master exam. Passing the exam earns the learning path certificate.</p>
+          <p class="muted">Finish every course in a learning path to unlock its master exam. Passing the exam earns the certificate. Paths below your starting point are open to take straight away.</p>
           <ul class="exams">${paths.filter((p) => examForPath(p.id)).map((p) => {
-            const z = examForPath(p.id);
-            const cs = catalog.courses.filter((c) => c.path_id === p.id);
-            const ready = cs.length > 0 && cs.every((c) => { const st = courseStats(c, done); const q = quizForCourse(c.id); return st.complete && (!q || q.passed); });
-            return `<li class="exam ${z.passed ? "is-passed" : ready ? "is-ready" : ""}">
-              <div><h3>${esc(p.title)}</h3><span class="muted small">${z.questions} question${z.questions === 1 ? "" : "s"}, pass mark ${z.pass_pct}%${z.attempts ? `, best score ${z.best_pct}%` : ""}</span></div>
-              ${z.passed ? `<span class="pill">Passed</span>` : ready ? `<a class="btn btn-primary btn-sm" href="#/quiz/${z.id}">${z.attempts ? "Try again" : "Take the exam"}</a>` : `<span class="muted small">Locked, ${cs.filter((c) => { const st = courseStats(c, done); const q = quizForCourse(c.id); return st.complete && (!q || q.passed); }).length} of ${cs.length} courses done</span>`}
+            const z = examForPath(p.id); const pr = pathProgress(p, done);
+            return `<li class="exam ${z.passed ? "is-passed" : pr.examReady ? "is-ready" : ""}">
+              <div><h3>${esc(p.title)}</h3><span class="muted small">${z.questions} question${z.questions === 1 ? "" : "s"}, pass mark ${z.pass_pct}%${z.attempts ? `, best score ${z.best_pct}%` : ""}${pr.waived ? ", waived path" : ""}</span></div>
+              ${z.passed ? `<span class="pill">Passed</span>` : pr.examReady ? `<a class="btn btn-primary btn-sm" href="#/quiz/${z.id}">${z.attempts ? "Try again" : "Take the exam"}</a>` : `<span class="muted small">Locked, ${pr.doneCourses} of ${pr.cs.length} courses done</span>`}
             </li>`; }).join("")}</ul>` : ""}
       </section>`,
       bind() {
         let pathId = "";
-        const items = all.map((x) => ({ pathId: String(x.course.path_id), html: courseCard(x.course, x.st),
+        const items = all.map((x) => ({ pathId: String(x.course.path_id), html: courseCard(x.course, x.st, x.state),
           hay: (x.course.title + " " + x.course.description).toLowerCase() }));
         const grid = bindGrid(document.getElementById("grid"), (q, page) =>
           gridPage(items.filter((it) => !pathId || it.pathId === pathId), { q, page, emptyText: "No courses match. Try another word or clear the filter." }));
@@ -741,26 +789,35 @@
     await loadCatalog();
     const course = catalog.courses.find((c) => c.slug === slug);
     if (!course) return notFound("course");
-    const [done, certs] = await Promise.all([loadDone(), loadMyCerts(), loadQuizzes()]);
+    const [done] = await Promise.all([loadDone(), loadQuizzes()]);
     const st = courseStats(course, done);
     const quiz = quizForCourse(course.id);
-    const quizOk = !quiz || quiz.passed;
-    let cert = certs.find((c) => c.course_id === course.id);
-    if (st.complete && quizOk && !cert) {
-      const { data } = await sb.rpc("issue_certificate", { p_course_id: course.id });
-      if (data) cert = { id: data, course_id: course.id, issued_at: new Date().toISOString() };
-    }
+    const state = courseState(course, done);
     const path = catalog.paths.find((p) => p.id === course.path_id);
+    const cs = catalog.courses.filter((x) => x.path_id === course.path_id).sort((a, b) => a.sort - b.sort || a.id - b.id);
+    const idx = cs.findIndex((x) => x.id === course.id);
+    const prev = cs[idx - 1], nextCourse = cs[idx + 1];
+    const exam = path && examForPath(path.id);
+    const head = `<p class="crumb"><a href="#/learn">Learn</a> / ${esc(path?.title || "")}</p>
+        <div class="page-head"><h1>${esc(course.title)}</h1><button class="btn btn-ghost" id="share" type="button">Share course</button></div>
+        <p class="lede">${esc(course.description)}</p>`;
+    if (state.locked) return {
+      html: `<section class="pad">${head}
+        <div class="locked-box"><span class="lock" aria-hidden="true"></span><div><h2>Locked</h2>
+          <p>Finish <a href="#/course/${esc(prev.slug)}">${esc(prev.title)}</a>${quizForCourse(prev.id) ? " and pass its quiz" : ""} to unlock this course.</p></div></div>
+        <p class="muted">Course ${idx + 1} of ${cs.length} in ${esc(path?.title || "this path")}.</p></section>`,
+      bind() { document.getElementById("share").addEventListener("click", () => share(course.title, `#/course/${course.slug}`)); },
+    };
+    const finishStep = state.complete
+      ? nextCourse ? `<span class="stop-title">Course complete</span><a class="btn btn-primary btn-sm" style="align-self:flex-start" href="#/course/${esc(nextCourse.slug)}">Next course: ${esc(nextCourse.title)}</a>`
+                   : exam ? `<span class="stop-title">Course complete, last one in the path</span><a class="btn btn-accent btn-sm" style="align-self:flex-start" href="#/quiz/${exam.id}">${exam.passed ? "Master exam passed" : "Take the master exam"}</a>`
+                          : `<span class="stop-title">Learning path complete</span>`
+      : `<span class="stop-title muted">${nextCourse ? `Next course unlocks: ${esc(nextCourse.title)}` : "Master exam unlocks"}</span>`;
     return {
       html: `
-      <section class="pad">
-        <p class="crumb"><a href="#/learn">Learn</a> / ${esc(path?.title || "")}</p>
-        <div class="page-head">
-          <h1>${esc(course.title)}</h1>
-          <button class="btn btn-ghost" id="share" type="button">Share course</button>
-        </div>
-        <p class="lede">${esc(course.description)}</p>
-        <p class="muted">${st.done} of ${st.total} lessons complete, about ${st.minutes} minutes in total</p>
+      <section class="pad">${head}
+        ${state.waived ? `<p class="notice">This course is waived based on your starting survey. You can still work through it, or go straight to the path's master exam.</p>` : ""}
+        <p class="muted">Course ${idx + 1} of ${cs.length} in ${esc(path?.title || "")}. ${st.done} of ${st.total} lessons complete, about ${st.minutes} minutes in total</p>
         <ol class="rail rail-live">
           ${st.lessons.map((l) => {
             const isDone = done.has(l.id);
@@ -775,9 +832,7 @@
                   ${quiz.passed ? `<span class="muted small">Passed. <a href="#/quiz/${quiz.id}">Take it again</a> if you like.</span>` : `<a class="btn btn-primary btn-sm" style="align-self:flex-start" href="#/quiz/${quiz.id}">${quiz.attempts ? "Try again" : "Take the quiz"}</a>`}`
                 : `<span class="stop-title muted">${esc(quiz.title)}</span><span class="muted small">Unlocks when every lesson above is complete.</span>`}
             </div></li>` : ""}
-          <li class="stop cert ${cert ? "done" : ""}"><span class="dot"></span>
-            <div class="stop-body"><span class="stop-title">${cert ? `Certificate issued ${fmtDate(cert.issued_at)}` : quiz ? "Certificate, issued when the quiz is passed" : "Certificate, issued when every lesson is complete"}</span>
-            ${cert ? `<a href="#/certificates">Go to your certificates</a>` : ""}</div></li>
+          <li class="stop cert ${state.complete ? "done" : ""}"><span class="dot"></span><div class="stop-body">${finishStep}</div></li>
         </ol>
       </section>`,
       bind() { document.getElementById("share").addEventListener("click", () => share(course.title, `#/course/${course.slug}`)); },
@@ -800,6 +855,8 @@
       sb.from("lessons").select("*").eq("id", meta.id).single(), loadDone()]);
     if (error) throw error;
     const course = catalog.courses.find((c) => c.id === lesson.course_id);
+    await loadQuizzes();
+    if (courseState(course, done).locked) return viewCourse(course.slug);
     const siblings = lessonsOf(course.id);
     const i = siblings.findIndex((l) => l.id === lesson.id);
     const prev = siblings[i - 1], next = siblings[i + 1];
@@ -849,10 +906,9 @@
               <p class="done-note">Every lesson is complete. One step left: the end-of-course quiz.</p>
               <a class="btn btn-primary" href="#/quiz/${quiz.id}">Take the quiz</a>`;
           } else if (st.complete) {
-            await sb.rpc("issue_certificate", { p_course_id: course.id });
             document.getElementById("completebox").innerHTML = `
-              <p class="done-note">Course complete. Your certificate is ready.</p>
-              <a class="btn btn-primary" href="#/certificates">Get your certificate</a>`;
+              <p class="done-note">Course complete.</p>
+              <a class="btn btn-primary" href="#/course/${esc(course.slug)}">See what is next</a>`;
           } else {
             toast("Lesson marked complete");
             render();
@@ -1476,7 +1532,7 @@
           <div><span class="review-q">${k + 1}. ${esc(q?.prompt || "")}</span>
           ${!r.correct && help ? `<a class="small" href="#/lesson/${esc(help.slug)}">Review: ${esc(help.title)}</a>` : ""}</div></li>`; }).join("")}</ol>
       <div class="row" id="resultactions">
-        ${result.passed ? (isExam ? `<button class="btn btn-primary" id="pathcert" type="button">Get your learning path certificate</button>` : `<a class="btn btn-primary" href="#/certificates">Get your certificate</a>`)
+        ${result.passed ? (isExam ? `<button class="btn btn-primary" id="pathcert" type="button">Get your learning path certificate</button>` : `<a class="btn btn-primary" href="${backHref}">Continue to the next course</a>`)
                         : `<button class="btn btn-primary" id="retake" type="button">Try again</button>`}
         <a class="btn btn-ghost" href="${backHref}">${backLabel}</a>
       </div>
@@ -1543,9 +1599,7 @@
             submit.disabled = true; submit.textContent = "Marking…";
             const { data, error } = await sb.rpc("submit_quiz", { p_quiz_id: qid, p_answers: answers });
             if (error) { toast(error.message); submit.disabled = false; submit.textContent = "Submit"; return; }
-             if (!data) { toast("No result came back. Try again."); submit.disabled = false; submit.textContent = "Submit"; return; }
             result = data; quizzes = null;
-            if (result.passed && course) { try { await sb.rpc("issue_certificate", { p_course_id: course.id }); } catch (_) {} }
             paint();
           });
         };
@@ -1589,7 +1643,9 @@
           if (rows.some((r) => !r)) { errEl.textContent = "Answer every question, or skip for now."; errEl.hidden = false; return; }
           const { error } = await sb.from("survey_answers").upsert(rows, { onConflict: "user_id,question_id" });
           if (error) { errEl.textContent = error.message; errEl.hidden = false; return; }
-          survey = null;
+          await sb.rpc("set_start_path");
+          await loadProfile();
+          survey = null; quizzes = null;
           toast("Answers saved");
           if (hasAnswers) go("#/learn"); else goAfterAuth();
         });
@@ -1619,10 +1675,11 @@
           <button type="button" data-page="${page + 1}" ${page >= pages ? "disabled" : ""}>›</button></nav>` : "";
       if (!rows.length) return `<div class="empty">No learners match.</div>`;
       return `<div class="table-scroll"><table class="learners">
-        <thead><tr><th>Learner</th><th>Email</th><th>Joined</th><th>Lessons done</th><th>Certificates</th><th>Last activity</th><th>Role</th></tr></thead>
+        <thead><tr><th>Learner</th><th>Email</th><th>Lessons done</th><th>Quizzes passed</th><th>Exams passed</th><th>Avg quiz</th><th>Avg exam</th><th>Last activity</th><th>Role</th></tr></thead>
         <tbody>${rows.map((r) => `<tr data-id="${r.id}" tabindex="0">
           <td><a href="#/admin/learner/${r.id}">${esc(r.full_name || "(no name)")}</a></td><td>${esc(r.email)}</td>
-          <td>${fmtDate(r.created_at)}</td><td>${r.lessons_done}</td><td>${r.certificates}</td>
+          <td>${r.lessons_done}</td><td>${r.quizzes_passed}</td><td>${r.exams_passed}</td>
+          <td>${r.avg_quiz == null ? `<span class="muted">–</span>` : r.avg_quiz + "%"}</td><td>${r.avg_exam == null ? `<span class="muted">–</span>` : r.avg_exam + "%"}</td>
           <td>${r.last_activity ? fmtDate(r.last_activity) : `<span class="muted">Not started</span>`}</td>
           <td>${r.is_admin ? `<span class="pill">Admin</span>` : `<span class="muted">Learner</span>`}</td></tr>`).join("")}
         </tbody></table></div>${pager}`;
