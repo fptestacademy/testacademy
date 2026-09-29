@@ -1,4 +1,4 @@
-# FP test Academy Training
+ Fieldbook Training
 
 A training site with accounts, learning paths, video lessons, troubleshooting guides, certificates, and an admin report of who has completed what. It runs free on GitHub Pages plus a free Supabase project. There is no build step: plain HTML, CSS, and JavaScript.
 
@@ -9,11 +9,32 @@ A training site with accounts, learning paths, video lessons, troubleshooting gu
 | File | Purpose |
 |---|---|
 | `index.html` | The single page that loads everything |
-| `js/config.js` | Site name and your Supabase keys. The only file you must edit |
+| `js/config.js` | Site name, Supabase keys, utility-bar links, landing-page text, and page size. The only file you must edit |
 | `js/app.js` | Sign-up, sign-in, pages, progress, certificates, admin report |
 | `css/styles.css` | All styling |
 | `supabase/schema.sql` | Database tables, access rules, and sample content |
 | `manifest.webmanifest`, `icon.svg` | Lets people add the site to a phone home screen |
+
+## Pages
+
+| Page | What it shows |
+|---|---|
+| Landing / Sign in | Banner text (set in `js/config.js`) with the sign-in card beside it |
+| Courses | Card grid of every course, filter chips per learning path, search, and pagination |
+| Video Library | Every video lesson as a card with its thumbnail |
+| Resource Library | Every troubleshooting guide as a card, searchable by symptom or part |
+| Quizzes | Each course can have an end-of-course quiz that unlocks when every lesson is done. Six question types: multiple choice, true/false, select all that apply, slider (exact value or range), pin on a picture, and put in order. Each question can link a troubleshooting guide for help. Grading happens in the database, so answer keys never reach the browser. The course certificate is issued only after a pass |
+| Master exams | Each learning path can have a master exam that unlocks once every course quiz in the path is passed. Passing it issues a learning path certificate |
+| Certificates | Course and learning path certificates, with verification links |
+| Learners (admins) | Searchable, paged list of every learner. Click one for their course progress and survey answers, and to grant or remove admin access. CSV export of all progress |
+| Starting survey | New learners answer a short survey after signing up. Admins write the questions under Content → Starting survey and tick which learning paths each answer points at; the learner's Courses page then puts the best-matching path first, marked "Recommended for you" |
+| Content (admins) | Add, edit, reorder, and delete learning paths, courses, and lessons without opening Supabase. Video lessons use Markdown with a live preview; troubleshooting guides are a title, a description, and a PDF upload |
+
+**Resource Library groups.** Admins create groups under Content → Guide groups (name, search keywords, thumbnail picture) and put a guide in a group from the guide editor. The library shows group tiles and ungrouped guides; a search shows the groups whose guides match plus matching ungrouped guides. PDF guides get a first-page thumbnail made automatically at upload.
+
+PDF guides are stored in a private Supabase Storage bucket called `guides` (created by `schema.sql`). Learners read them on the page through a viewer with no download button, and the link to the file expires after an hour. The text inside each PDF is extracted on upload so the Resource Library search finds it. Scanned PDFs with no text layer still work, they just match on title and description only.
+
+Admins see **Learners** and **Content** in the header. The first admin is created with the SQL line at the bottom of `schema.sql`; after that, admins promote others from the Learners page. The database will not let an admin demote themselves or remove the last admin. Everything under Content saves straight to Supabase and is live for learners immediately. Deleting a course or path also deletes its lessons and learner progress, so the site asks you to confirm first. Course thumbnails are set in the course editor (an https:// image link); cards without one show a plain navy tile.
 
 ## Setup (about 15 minutes)
 
