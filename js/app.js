@@ -33,6 +33,7 @@
   let profile = null;
   let catalog = null;       // { paths, courses, lessons } without lesson bodies
   let survey = null;        // { questions: [{...options:[{...paths:[]}]}], answers: Map(question_id -> option_id) }
+  let quizzes = null;       // quiz_summary() rows for the signed-in learner
   const SKIP_KEY = "surveySkipped";
   let renderToken = 0;
 
@@ -150,6 +151,28 @@
     return parts.join("\n").replace(/\s+/g, " ").trim().slice(0, 200000);
   }
 
+  // First page of a PDF as a PNG blob, for Resource Library tiles.
+  async function pdfThumbnail(file) {
+    const pdfjs = await loadPdfjs();
+    const doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+    const page = await doc.getPage(1);
+    const base = page.getViewport({ scale: 1 });
+    const vp = page.getViewport({ scale: 480 / base.width });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(vp.width); canvas.height = Math.round(vp.height);
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+    return new Promise((res) => canvas.toBlob(res, "image/png"));
+  }
+
+  async function uploadImage(file, folder) {
+    if (!/^image\/(png|jpeg|webp)$/.test(file.type)) throw new Error("Use a PNG, JPEG, or WebP image.");
+    if (file.size > 8 * 1024 * 1024) throw new Error("That image is over 8 MB.");
+    const path = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${file.type === "image/png" ? "png" : file.type === "image/webp" ? "webp" : "jpg"}`;
+    const { error } = await sb.storage.from("images").upload(path, file, { contentType: file.type });
+    if (error) throw new Error("The image did not upload: " + error.message);
+    return path;
+  }
+
   async function signedPdfUrl(path) {
     const { data, error } = await sb.storage.from("guides").createSignedUrl(path, 3600);
     if (error) throw new Error(error.message);
@@ -208,7 +231,7 @@
     const [p, c, l] = await Promise.all([
       sb.from("paths").select("*").order("sort"),
       sb.from("courses").select("*").order("sort"),
-      sb.from("lessons").select("id,course_id,slug,title,kind,minutes,sort,video_url,description,pdf_path").order("sort"),
+      sb.from("lessons").select("id,course_id,slug,title,kind,minutes,sort,video_url,description,pdf_path,group_id,thumb_path").order("sort"),
     ]);
     const err = p.error || c.error || l.error;
     if (err) throw err;
@@ -223,9 +246,20 @@
     return new Map(data.map((r) => [r.lesson_id, r.completed_at]));
   }
 
+  async function loadQuizzes() {
+    if (quizzes) return quizzes;
+    const { data, error } = await sb.rpc("quiz_summary");
+    if (error) throw error;
+    quizzes = data.filter((z) => z.active && z.questions > 0);
+    return quizzes;
+  }
+  const quizForCourse = (id) => (quizzes || []).find((z) => z.course_id === id);
+  const examForPath = (id) => (quizzes || []).find((z) => z.path_id === id);
+  const publicImage = (path) => (path ? sb.storage.from("images").getPublicUrl(path).data.publicUrl : "");
+
   async function loadMyCerts() {
     const { data, error } = await sb.from("certificates")
-      .select("id,course_id,issued_at").eq("user_id", session.user.id).order("issued_at", { ascending: false });
+      .select("id,course_id,path_id,issued_at").eq("user_id", session.user.id).order("issued_at", { ascending: false });
     if (error) throw error;
     return data;
   }
@@ -327,7 +361,7 @@
     const so = document.getElementById("signout");
     if (so) so.addEventListener("click", async () => {
       await sb.auth.signOut();
-      session = null; profile = null; catalog = null; survey = null;
+      session = null; profile = null; catalog = null; survey = null; quizzes = null;
       go("#/");
     });
     renderFooter();
@@ -604,7 +638,7 @@
 
   async function viewLearn() {
     await loadCatalog();
-    const [done] = await Promise.all([loadDone(), loadSurvey()]);
+    const [done] = await Promise.all([loadDone(), loadSurvey(), loadQuizzes()]);
     const scores = pathScores();
     const paths = [...catalog.paths].sort((a, b) => (scores.get(b.id) || 0) - (scores.get(a.id) || 0) || a.sort - b.sort);
     const topPath = scores.size && (scores.get(paths[0].id) || 0) > 0 ? paths[0] : null;
@@ -639,6 +673,17 @@
           <input id="q" class="search" type="search" placeholder="Search courses" autocomplete="off">
         </div>
         <div id="grid"></div>
+        ${paths.some((p) => examForPath(p.id)) ? `
+          <h2 class="exams-head">Master exams</h2>
+          <p class="muted">Pass every course quiz in a learning path to unlock its master exam. Passing the exam earns the learning path certificate.</p>
+          <ul class="exams">${paths.filter((p) => examForPath(p.id)).map((p) => {
+            const z = examForPath(p.id);
+            const cs = catalog.courses.filter((c) => c.path_id === p.id);
+            const ready = cs.length > 0 && cs.every((c) => { const st = courseStats(c, done); const q = quizForCourse(c.id); return st.complete && (!q || q.passed); });
+            return `<li class="exam ${z.passed ? "is-passed" : ready ? "is-ready" : ""}">
+              <div><h3>${esc(p.title)}</h3><span class="muted small">${z.questions} question${z.questions === 1 ? "" : "s"}, pass mark ${z.pass_pct}%${z.attempts ? `, best score ${z.best_pct}%` : ""}</span></div>
+              ${z.passed ? `<span class="pill">Passed</span>` : ready ? `<a class="btn btn-primary btn-sm" href="#/quiz/${z.id}">${z.attempts ? "Try again" : "Take the exam"}</a>` : `<span class="muted small">Locked, ${cs.filter((c) => { const st = courseStats(c, done); const q = quizForCourse(c.id); return st.complete && (!q || q.passed); }).length} of ${cs.length} courses done</span>`}
+            </li>`; }).join("")}</ul>` : ""}
       </section>`,
       bind() {
         let pathId = "";
@@ -696,10 +741,12 @@
     await loadCatalog();
     const course = catalog.courses.find((c) => c.slug === slug);
     if (!course) return notFound("course");
-    const [done, certs] = await Promise.all([loadDone(), loadMyCerts()]);
+    const [done, certs] = await Promise.all([loadDone(), loadMyCerts(), loadQuizzes()]);
     const st = courseStats(course, done);
+    const quiz = quizForCourse(course.id);
+    const quizOk = !quiz || quiz.passed;
     let cert = certs.find((c) => c.course_id === course.id);
-    if (st.complete && !cert) {
+    if (st.complete && quizOk && !cert) {
       const { data } = await sb.rpc("issue_certificate", { p_course_id: course.id });
       if (data) cert = { id: data, course_id: course.id, issued_at: new Date().toISOString() };
     }
@@ -722,8 +769,14 @@
               <div class="stop-body"><span class="kind">${l.kind === "video" ? "Video" : "Guide"}, ${l.minutes} min${isDone ? ", completed" : ""}</span>
               <a class="stop-title" href="#/lesson/${esc(l.slug)}">${esc(l.title)}</a></div></li>`;
           }).join("")}
+          ${quiz ? `<li class="stop quiz ${quiz.passed ? "done" : st.complete ? "now" : ""}"><span class="dot"></span>
+            <div class="stop-body"><span class="kind">End-of-course quiz, ${quiz.questions} question${quiz.questions === 1 ? "" : "s"}, pass mark ${quiz.pass_pct}%${quiz.attempts ? `, best score ${quiz.best_pct}%` : ""}</span>
+              ${st.complete ? `<a class="stop-title" href="#/quiz/${quiz.id}">${esc(quiz.title)}</a>
+                  ${quiz.passed ? `<span class="muted small">Passed. <a href="#/quiz/${quiz.id}">Take it again</a> if you like.</span>` : `<a class="btn btn-primary btn-sm" style="align-self:flex-start" href="#/quiz/${quiz.id}">${quiz.attempts ? "Try again" : "Take the quiz"}</a>`}`
+                : `<span class="stop-title muted">${esc(quiz.title)}</span><span class="muted small">Unlocks when every lesson above is complete.</span>`}
+            </div></li>` : ""}
           <li class="stop cert ${cert ? "done" : ""}"><span class="dot"></span>
-            <div class="stop-body"><span class="stop-title">${cert ? `Certificate issued ${fmtDate(cert.issued_at)}` : "Certificate, issued when every lesson is complete"}</span>
+            <div class="stop-body"><span class="stop-title">${cert ? `Certificate issued ${fmtDate(cert.issued_at)}` : quiz ? "Certificate, issued when the quiz is passed" : "Certificate, issued when every lesson is complete"}</span>
             ${cert ? `<a href="#/certificates">Go to your certificates</a>` : ""}</div></li>
         </ol>
       </section>`,
@@ -789,7 +842,13 @@
           if (e1 && e1.code !== "23505") { btn.disabled = false; toast("Could not save. Check your connection and try again."); return; }
           const nowDone = await loadDone();
           const st = courseStats(course, nowDone);
-          if (st.complete) {
+          await loadQuizzes();
+          const quiz = quizForCourse(course.id);
+          if (st.complete && quiz && !quiz.passed) {
+            document.getElementById("completebox").innerHTML = `
+              <p class="done-note">Every lesson is complete. One step left: the end-of-course quiz.</p>
+              <a class="btn btn-primary" href="#/quiz/${quiz.id}">Take the quiz</a>`;
+          } else if (st.complete) {
             await sb.rpc("issue_certificate", { p_course_id: course.id });
             document.getElementById("completebox").innerHTML = `
               <p class="done-note">Course complete. Your certificate is ready.</p>
@@ -803,20 +862,66 @@
     };
   }
 
+  async function loadGuides() {
+    const [{ data, error }, { data: groups, error: e2 }] = await Promise.all([
+      sb.from("lessons").select("id,slug,title,body,description,pdf_text,pdf_path,thumb_path,group_id,course_id,minutes").eq("kind", "guide").order("title"),
+      sb.from("guide_groups").select("*").order("sort").order("name")]);
+    if (error || e2) throw error || e2;
+    // one request signs every thumbnail for an hour
+    const thumbs = new Map();
+    const paths = data.filter((g) => g.thumb_path).map((g) => g.thumb_path);
+    if (paths.length) {
+      const { data: signed } = await sb.storage.from("guides").createSignedUrls(paths, 3600);
+      (signed || []).forEach((x) => { if (x.signedUrl) thumbs.set(x.path, x.signedUrl); });
+    }
+    return { guides: data, groups, thumbs };
+  }
+
+  const excerpt = (body) => String(body || "").replace(/[#*`>_\[\]]/g, "").replace(/\s+/g, " ").trim().slice(0, 160);
+
+  function guideTile(g, thumbs) {
+    const course = catalog.courses.find((c) => c.id === g.course_id)?.title || "";
+    const t = g.thumb_path && thumbs.get(g.thumb_path);
+    return `<li class="card">
+      <a class="thumb thumb-doc ${t ? "" : "thumb-plain"}" href="#/lesson/${esc(g.slug)}" tabindex="-1" aria-hidden="true">${t ? `<img src="${esc(t)}" alt="" loading="lazy">` : ""}</a>
+      <div class="card-body">
+        <span class="card-kind">${g.pdf_path ? "PDF guide" : "Guide"}, ${g.minutes} min${course ? `, ${esc(course)}` : ""}</span>
+        <h3><a href="#/lesson/${esc(g.slug)}">${esc(g.title)}</a></h3>
+        <p class="card-desc">${esc(g.description || excerpt(g.body))}</p>
+      </div></li>`;
+  }
+
+  function groupTile(gr, n, hits) {
+    return `<li class="card card-group">
+      <a class="thumb" href="#/guides/group/${gr.id}" tabindex="-1" aria-hidden="true"><img src="${esc(publicImage(gr.image_path))}" alt="" loading="lazy"><span class="group-badge">${n} guide${n === 1 ? "" : "s"}</span></a>
+      <div class="card-body">
+        <span class="card-kind">Group${hits ? `, ${hits} match${hits === 1 ? "" : "es"}` : ""}</span>
+        <h3><a href="#/guides/group/${gr.id}">${esc(gr.name)}</a></h3>
+        ${gr.keywords ? `<p class="card-desc">${esc(gr.keywords)}</p>` : ""}
+      </div></li>`;
+  }
+
   async function viewGuides() {
     await loadCatalog();
-    const { data, error } = await sb.from("lessons").select("id,slug,title,body,description,pdf_text,pdf_path,course_id,minutes").eq("kind", "guide").order("title");
-    if (error) throw error;
-    const excerpt = (body) => String(body || "").replace(/[#*`>_\[\]]/g, "").replace(/\s+/g, " ").trim().slice(0, 160);
-    const items = data.map((g) => {
-      const course = catalog.courses.find((c) => c.id === g.course_id)?.title || "";
-      return { hay: [g.title, g.description, g.body, g.pdf_text].join(" ").toLowerCase(), html: `<li class="card">
-        <div class="card-body">
-          <span class="card-kind">${g.pdf_path ? "PDF guide" : "Guide"}, ${g.minutes} min${course ? `, ${esc(course)}` : ""}</span>
-          <h3><a href="#/lesson/${esc(g.slug)}">${esc(g.title)}</a></h3>
-          <p class="card-desc">${esc(g.description || excerpt(g.body))}</p>
-        </div></li>` };
-    });
+    const { guides, groups, thumbs } = await loadGuides();
+    const hay = (g) => [g.title, g.description, g.body, g.pdf_text].join(" ").toLowerCase();
+    const ghay = (gr) => (gr.name + " " + gr.keywords).toLowerCase();
+    const match = (text, q) => q.split(/\s+/).every((w) => text.includes(w));
+    const inGroup = (id) => guides.filter((g) => g.group_id === id);
+
+    // Tiles: groups first, then ungrouped guides. A search shows the groups whose guides (or name/keywords) match, plus matching ungrouped guides.
+    const build = (q) => {
+      const tiles = [];
+      for (const gr of groups) {
+        const members = inGroup(gr.id);
+        const hits = q ? members.filter((g) => match(hay(g), q)).length : 0;
+        if (!q || hits || match(ghay(gr), q)) tiles.push({ html: groupTile(gr, members.length, hits), hay: "" });
+      }
+      for (const g of guides.filter((g) => !g.group_id || !groups.some((gr) => gr.id === g.group_id))) {
+        if (!q || match(hay(g), q)) tiles.push({ html: guideTile(g, thumbs), hay: "" });
+      }
+      return tiles;
+    };
     return {
       html: `<section class="page-title">
         <h1>Resource Library</h1>
@@ -827,8 +932,26 @@
         </div>
         <div id="grid"></div></section>`,
       bind() {
-        bindGrid(document.getElementById("grid"), (q, page) => gridPage(items, { q, page, emptyText: "No guide mentions that. Try a symptom or a part name, such as “no internet” or “cable”." })).paint();
+        bindGrid(document.getElementById("grid"), (q, page) => gridPage(build(q), { q: "", page, emptyText: "No guide mentions that. Try a symptom or a part name, such as “no internet” or “cable”." })).paint();
       },
+    };
+  }
+
+  async function viewGuideGroup(id) {
+    await loadCatalog();
+    const { guides, groups, thumbs } = await loadGuides();
+    const gr = groups.find((x) => x.id === Number(id));
+    if (!gr) return notFound("group");
+    const members = guides.filter((g) => g.group_id === gr.id);
+    const items = members.map((g) => ({ html: guideTile(g, thumbs), hay: [g.title, g.description, g.body, g.pdf_text].join(" ").toLowerCase() }));
+    return {
+      html: `<section class="page-title">
+        <p class="crumb"><a href="#/guides">Resource Library</a> / ${esc(gr.name)}</p>
+        <div class="group-head"><img src="${esc(publicImage(gr.image_path))}" alt=""><div><h1>${esc(gr.name)}</h1><p class="muted">${members.length} guide${members.length === 1 ? "" : "s"}${gr.keywords ? `. ${esc(gr.keywords)}` : ""}</p></div></div>
+        <div class="toolbar"><span></span><label for="q" class="sr">Search this group</label>
+          <input id="q" class="search" type="search" placeholder="Search this group" autocomplete="off"></div>
+        <div id="grid"></div></section>`,
+      bind() { bindGrid(document.getElementById("grid"), (q, page) => gridPage(items, { q, page, emptyText: "No guide in this group mentions that." })).paint(); },
     };
   }
 
@@ -862,7 +985,8 @@
   async function viewCertificates() {
     await loadCatalog();
     const certs = await loadMyCerts();
-    const title = (c) => catalog.courses.find((x) => x.id === c.course_id)?.title || "Course";
+    const title = (c) => c.path_id ? (catalog.paths.find((x) => x.id === c.path_id)?.title || "Learning path") + " (learning path)"
+                                   : catalog.courses.find((x) => x.id === c.course_id)?.title || "Course";
     return {
       html: `<section class="pad">
         <h1>Your certificates</h1>
@@ -968,6 +1092,7 @@
             <button type="button" class="icon-btn" data-move="courses:${c.id}:-1" aria-label="Move up" ${i === 0 ? "disabled" : ""}>&#8593;</button>
             <button type="button" class="icon-btn" data-move="courses:${c.id}:1" aria-label="Move down" ${i === list.length - 1 ? "disabled" : ""}>&#8595;</button>
             <a class="btn btn-ghost btn-sm" href="#/manage/course/${c.id}">Edit course</a>
+            <a class="btn btn-ghost btn-sm" href="#/manage/quiz/course/${c.id}">Quiz</a>
             <a class="btn btn-ghost btn-sm" href="#/manage/lesson/new?course=${c.id}&kind=guide">Add guide</a>
             <a class="btn btn-primary btn-sm" href="#/manage/lesson/new?course=${c.id}">Add video</a>
           </span>
@@ -986,6 +1111,7 @@
             <button type="button" class="icon-btn" data-move="paths:${p.id}:-1" aria-label="Move up" ${i === 0 ? "disabled" : ""}>&#8593;</button>
             <button type="button" class="icon-btn" data-move="paths:${p.id}:1" aria-label="Move down" ${i === list.length - 1 ? "disabled" : ""}>&#8595;</button>
             <a class="btn btn-ghost btn-sm" href="#/manage/path/${p.id}">Edit path</a>
+            <a class="btn btn-ghost btn-sm" href="#/manage/quiz/path/${p.id}">Master exam</a>
             <a class="btn btn-primary btn-sm" href="#/manage/course/new?path=${p.id}">Add course</a>
           </span>
         </div>
@@ -996,7 +1122,7 @@
     return {
       html: `<section class="page-title">
         <div class="page-head"><h1>Content</h1>
-          <div class="row"><a class="btn btn-ghost" href="#/manage/survey">Starting survey</a>
+          <div class="row"><a class="btn btn-ghost" href="#/manage/groups">Guide groups</a><a class="btn btn-ghost" href="#/manage/survey">Starting survey</a>
           <a class="btn btn-primary" href="#/manage/path/new">Add learning path</a></div></div>
         <p class="muted">Learning paths hold courses; courses hold lessons in order. Use the arrows to reorder. Changes go live as soon as you save.</p>
         ${paths.length ? paths.map(pathBlock).join("") : `<div class="empty">No content yet. Start by adding a learning path.</div>`}
@@ -1123,6 +1249,7 @@
       row = data;
     }
     if (!row) return notFound("lesson");
+    const { data: groups } = await sb.from("guide_groups").select("id,name").order("sort");
     const isGuide = row.kind === "guide";
     const courseSelect = `<label for="course_id">Course</label><select id="course_id" name="course_id">
       ${catalog.courses.map((c) => `<option value="${c.id}" ${c.id === row.course_id ? "selected" : ""}>${esc(c.title)}</option>`).join("")}</select>`;
@@ -1154,6 +1281,9 @@
           </div>
 
           <div id="guidefields" ${isGuide ? "" : "hidden"}>
+            <label for="group_id">Resource Library group (optional)</label>
+            <select id="group_id" name="group_id"><option value="">No group, shows as its own tile</option>
+              ${(groups || []).map((g) => `<option value="${g.id}" ${g.id === row.group_id ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select>
             <label for="pdf">PDF file</label>
             <div class="file-box">
               <input id="pdf" name="pdf" type="file" accept="application/pdf,.pdf">
@@ -1197,8 +1327,9 @@
           const values = {
             course_id: Number(v.course_id), title: v.title.trim(), slug: slugify(v.slug) || slugify(v.title), kind: v.kind,
             description: v.description.trim(), video_url: guide ? null : v.video_url.trim(), body, minutes: Math.max(1, Number(v.minutes) || 5), sort: row.sort,
+            group_id: guide && v.group_id ? Number(v.group_id) : null,
           };
-          if (!guide || v.remove_pdf) { values.pdf_path = null; values.pdf_name = null; values.pdf_text = null; }
+          if (!guide || v.remove_pdf) { values.pdf_path = null; values.pdf_name = null; values.pdf_text = null; values.thumb_path = null; }
 
           const btn = document.querySelector("#editform button[type=submit]");
           const say = (t) => { btn.textContent = t; };
@@ -1213,9 +1344,18 @@
             const path = `lessons/${id}/${Date.now()}.pdf`;
             const up = await sb.storage.from("guides").upload(path, file, { contentType: "application/pdf", upsert: false });
             if (up.error) throw new Error("The PDF did not upload: " + up.error.message + ". The lesson was saved without it.");
-            const old = row.pdf_path;
-            await saveRow("lessons", id, { pdf_path: path, pdf_name: file.name, pdf_text: text });
-            if (old) sb.storage.from("guides").remove([old]);
+            say("Making thumbnail…");
+            let thumbPath = null;
+            try {
+              const png = await pdfThumbnail(file);
+              thumbPath = `thumbs/${id}/${Date.now()}.png`;
+              const t = await sb.storage.from("guides").upload(thumbPath, png, { contentType: "image/png" });
+              if (t.error) thumbPath = null;
+            } catch (_) { thumbPath = null; }
+            const old = row.pdf_path, oldThumb = row.thumb_path;
+            await saveRow("lessons", id, { pdf_path: path, pdf_name: file.name, pdf_text: text, thumb_path: thumbPath });
+            const gone = [old, oldThumb].filter(Boolean);
+            if (gone.length) sb.storage.from("guides").remove(gone);
           } else if (guide && v.remove_pdf && row.pdf_path) {
             sb.storage.from("guides").remove([row.pdf_path]);
           }
@@ -1226,6 +1366,189 @@
           if (row.pdf_path) await sb.storage.from("guides").remove([row.pdf_path]);
           await deleteRow("lessons", sub.id);
         });
+      },
+    };
+  }
+
+  // ---------- views: quiz (learner) ----------
+  async function viewQuiz(id) {
+    await loadCatalog();
+    const qid = Number(id);
+    const [{ data: quiz, error: e1 }, { data: unlocked, error: e2 }] = await Promise.all([
+      sb.rpc("quiz_for_learner", { p_quiz_id: qid }), sb.rpc("quiz_unlocked", { p_quiz_id: qid }), loadQuizzes()]);
+    if (e1 || e2) throw e1 || e2;
+    if (!quiz) return notFound("quiz");
+    const summary = quizzes.find((z) => z.id === qid) || { attempts: 0 };
+    const course = quiz.course_id ? catalog.courses.find((c) => c.id === quiz.course_id) : null;
+    const path = catalog.paths.find((p) => p.id === (quiz.path_id || course?.path_id));
+    const isExam = !!quiz.path_id;
+    const backHref = course ? `#/course/${course.slug}` : "#/learn";
+    const backLabel = course ? "Back to the course" : "Back to your courses";
+    const crumb = `<p class="crumb"><a href="#/learn">Learn</a> / ${course ? `<a href="#/course/${esc(course.slug)}">${esc(course.title)}</a>` : esc(path?.title || "")}</p>`;
+
+    if (!unlocked) return { html: `<section class="narrow pad">${crumb}<h1>${esc(quiz.title)}</h1>
+      <p class="notice">${isExam ? "The master exam unlocks once every course quiz in this learning path is passed." : "This quiz unlocks once every lesson in the course is complete."}</p>
+      <a class="btn btn-primary" href="${backHref}">${backLabel}</a></section>` };
+
+    const qs = quiz.questions;
+    const answers = {};
+    let i = -1;          // -1 = intro screen
+    let result = null;
+    const guideOf = (lid) => catalog.lessons.find((l) => l.id === lid);
+
+    const intro = () => `<section class="narrow pad quiz">${crumb}
+      <h1>${esc(quiz.title)}</h1>
+      ${quiz.intro ? `<p class="lede">${esc(quiz.intro)}</p>` : ""}
+      <ul class="quiz-facts">
+        <li><strong>${qs.length}</strong> question${qs.length === 1 ? "" : "s"}</li>
+        <li>Pass mark <strong>${quiz.pass_pct}%</strong></li>
+        ${summary.attempts ? `<li>Your best so far <strong>${summary.best_pct}%</strong>${summary.passed ? ", passed" : ""}</li>` : ""}
+      </ul>
+      <p class="muted">Answer every question, then submit. You can go back and change answers before submitting, and you can retake the ${isExam ? "exam" : "quiz"} if you do not pass.</p>
+      <div class="row"><button class="btn btn-primary" id="start" type="button">${summary.attempts ? "Start again" : "Start"}</button><a class="btn btn-ghost" href="${backHref}">${backLabel}</a></div>
+    </section>`;
+
+    const renderQ = (q) => {
+      const a = answers[q.id];
+      const c = q.config || {};
+      const help = q.help_lesson_id && guideOf(q.help_lesson_id);
+      let body = "";
+      switch (q.kind) {
+        case "choice":
+          body = c.options.map((o) => `<label class="opt"><input type="radio" name="a" value="${esc(o.id)}" ${a === o.id ? "checked" : ""}> ${esc(o.label)}</label>`).join("");
+          break;
+        case "truefalse":
+          body = [["true", "True"], ["false", "False"]].map(([v, l]) => `<label class="opt"><input type="radio" name="a" value="${v}" ${String(a) === v ? "checked" : ""}> ${l}</label>`).join("");
+          break;
+        case "multi":
+          body = `<p class="muted small">Select all that apply.</p>` + c.options.map((o) => `<label class="opt"><input type="checkbox" name="a" value="${esc(o.id)}" ${(a || []).includes(o.id) ? "checked" : ""}> ${esc(o.label)}</label>`).join("");
+          break;
+        case "slider": {
+          const v = a ?? c.min;
+          body = `<div class="slider-wrap">
+            <output class="slider-val" for="slider">${v}${c.unit ? " " + esc(c.unit) : ""}</output>
+            <input type="range" id="slider" name="a" min="${c.min}" max="${c.max}" step="${c.step || 1}" value="${v}">
+            <div class="slider-ends"><span>${c.min}${c.unit ? " " + esc(c.unit) : ""}</span><span>${c.max}${c.unit ? " " + esc(c.unit) : ""}</span></div>
+            ${a === undefined ? `<p class="muted small">Drag the slider to answer.</p>` : ""}
+          </div>`;
+          break;
+        }
+        case "pin":
+          body = `<p class="muted small">Tap the picture to place your pin.</p>
+            <div class="pin-wrap" id="pinwrap"><img src="${esc(publicImage(q.image_path))}" alt="" draggable="false">
+              ${a ? `<span class="pin" style="left:${a.x * 100}%;top:${a.y * 100}%"></span>` : ""}</div>`;
+          break;
+        case "order": {
+          const seq = a || c.options.map((o) => o.id);
+          const label = (oid) => c.options.find((o) => o.id === oid)?.label || "";
+          body = `<p class="muted small">Put these in the correct order, first at the top.</p>
+            <ol class="order-list" id="orderlist">${seq.map((oid, k) => `<li data-id="${esc(oid)}"><span class="order-n">${k + 1}</span><span class="order-label">${esc(label(oid))}</span>
+              <span class="edit-actions"><button type="button" class="icon-btn" data-dir="-1" aria-label="Move up" ${k === 0 ? "disabled" : ""}>&#8593;</button><button type="button" class="icon-btn" data-dir="1" aria-label="Move down" ${k === seq.length - 1 ? "disabled" : ""}>&#8595;</button></span></li>`).join("")}</ol>`;
+          break;
+        }
+      }
+      const answered = qs.filter((x) => answers[x.id] !== undefined).length;
+      return `<section class="narrow pad quiz">${crumb}
+        <div class="quiz-top"><span class="muted small">Question ${i + 1} of ${qs.length}</span>
+          <div class="bar" aria-hidden="true"><span style="width:${Math.round(100 * (i + 1) / qs.length)}%"></span></div></div>
+        <div class="q-card">
+          <h2 class="q-prompt">${esc(q.prompt)}</h2>
+          ${q.image_path && q.kind !== "pin" ? `<img class="q-img" src="${esc(publicImage(q.image_path))}" alt="">` : ""}
+          <div class="q-body">${body}</div>
+          ${help ? `<p class="q-help">Need a hand? <a href="#/lesson/${esc(help.slug)}" target="_blank" rel="noopener">Open the guide: ${esc(help.title)}</a></p>` : ""}
+        </div>
+        <div class="quiz-nav">
+          <button class="btn btn-ghost" id="back" type="button" ${i === 0 ? "disabled" : ""}>Back</button>
+          ${i < qs.length - 1 ? `<button class="btn btn-primary" id="next" type="button">Next</button>`
+                              : `<button class="btn btn-accent" id="submit" type="button">Submit ${answered < qs.length ? `(${qs.length - answered} unanswered)` : ""}</button>`}
+        </div>
+      </section>`;
+    };
+
+    const resultView = () => `<section class="narrow pad quiz">${crumb}
+      <div class="score ${result.passed ? "is-pass" : "is-fail"}">
+        <span class="score-big">${result.score_pct}%</span>
+        <div><h1>${result.passed ? (isExam ? "Exam passed" : "Quiz passed") : "Not quite this time"}</h1>
+        <p>${result.correct} of ${result.total} correct. Pass mark is ${result.pass_pct}%.</p></div>
+      </div>
+      <ol class="review">${result.results.map((r, k) => { const q = qs.find((x) => x.id === r.id); const help = r.help_lesson_id && guideOf(r.help_lesson_id);
+        return `<li class="${r.correct ? "ok" : "bad"}"><span class="review-mark">${r.correct ? "✓" : "✗"}</span>
+          <div><span class="review-q">${k + 1}. ${esc(q?.prompt || "")}</span>
+          ${!r.correct && help ? `<a class="small" href="#/lesson/${esc(help.slug)}">Review: ${esc(help.title)}</a>` : ""}</div></li>`; }).join("")}</ol>
+      <div class="row" id="resultactions">
+        ${result.passed ? (isExam ? `<button class="btn btn-primary" id="pathcert" type="button">Get your learning path certificate</button>` : `<a class="btn btn-primary" href="#/certificates">Get your certificate</a>`)
+                        : `<button class="btn btn-primary" id="retake" type="button">Try again</button>`}
+        <a class="btn btn-ghost" href="${backHref}">${backLabel}</a>
+      </div>
+    </section>`;
+
+    return {
+      html: intro(),
+      bind() {
+        const paint = () => {
+          app.innerHTML = `<div class="wrap">${i < 0 ? intro() : result ? resultView() : renderQ(qs[i])}</div>`;
+          window.scrollTo({ top: 0 });
+          wire();
+        };
+        const readAnswer = (q) => {
+          switch (q.kind) {
+            case "choice": { const v = app.querySelector("input[name=a]:checked"); if (v) answers[q.id] = v.value; break; }
+            case "truefalse": { const v = app.querySelector("input[name=a]:checked"); if (v) answers[q.id] = v.value === "true"; break; }
+            case "multi": { const v = [...app.querySelectorAll("input[name=a]:checked")].map((x) => x.value); if (v.length) answers[q.id] = v; else delete answers[q.id]; break; }
+            case "order": answers[q.id] = [...app.querySelectorAll("#orderlist li")].map((li) => li.dataset.id); break;
+          }
+        };
+        const wire = () => {
+          const start = document.getElementById("start");
+          if (start) { start.addEventListener("click", () => { i = 0; paint(); }); return; }
+          if (result) {
+            const rt = document.getElementById("retake");
+            if (rt) rt.addEventListener("click", () => { for (const k in answers) delete answers[k]; result = null; i = 0; paint(); });
+            const pc = document.getElementById("pathcert");
+            if (pc) pc.addEventListener("click", async () => {
+              pc.disabled = true;
+              const { error } = await sb.rpc("issue_path_certificate", { p_path_id: quiz.path_id });
+              if (error) { toast(error.message); pc.disabled = false; return; }
+              go("#/certificates");
+            });
+            return;
+          }
+          const q = qs[i];
+          const slider = document.getElementById("slider");
+          if (slider) slider.addEventListener("input", () => { answers[q.id] = Number(slider.value); app.querySelector(".slider-val").textContent = slider.value + (q.config.unit ? " " + q.config.unit : ""); });
+          const pin = document.getElementById("pinwrap");
+          if (pin) pin.addEventListener("click", (e) => {
+            const r = pin.querySelector("img").getBoundingClientRect();
+            const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+            answers[q.id] = { x: Number(x.toFixed(4)), y: Number(y.toFixed(4)) };
+            let m = pin.querySelector(".pin"); if (!m) { m = document.createElement("span"); m.className = "pin"; pin.appendChild(m); }
+            m.style.left = x * 100 + "%"; m.style.top = y * 100 + "%";
+          });
+          const ol = document.getElementById("orderlist");
+          if (ol) ol.addEventListener("click", (e) => {
+            const b = e.target.closest("[data-dir]"); if (!b || b.disabled) return;
+            const li = b.closest("li"), dir = Number(b.dataset.dir);
+            if (dir < 0 && li.previousElementSibling) li.parentNode.insertBefore(li, li.previousElementSibling);
+            if (dir > 0 && li.nextElementSibling) li.parentNode.insertBefore(li.nextElementSibling, li);
+            readAnswer(q); paint();
+          });
+          document.getElementById("back").addEventListener("click", () => { readAnswer(q); i--; paint(); });
+          const next = document.getElementById("next");
+          if (next) next.addEventListener("click", () => { readAnswer(q); i++; paint(); });
+          const submit = document.getElementById("submit");
+          if (submit) submit.addEventListener("click", async () => {
+            readAnswer(q);
+            const missing = qs.filter((x) => answers[x.id] === undefined).length;
+            if (missing && !window.confirm(`${missing} question${missing === 1 ? " is" : "s are"} unanswered and will count as wrong. Submit anyway?`)) return;
+            submit.disabled = true; submit.textContent = "Marking…";
+            const { data, error } = await sb.rpc("submit_quiz", { p_quiz_id: qid, p_answers: answers });
+            if (error) { toast(error.message); submit.disabled = false; submit.textContent = "Submit"; return; }
+            result = data; quizzes = null;
+            if (result.passed && course) await sb.rpc("issue_certificate", { p_course_id: course.id }).catch(() => {});
+            paint();
+          });
+        };
+        wire();
       },
     };
   }
@@ -1360,6 +1683,11 @@
     ]);
     if (e1 || e2) throw e1 || e2;
     if (!p) return notFound("learner");
+    const { data: attempts } = await sb.from("quiz_attempts").select("quiz_id,score_pct,passed,submitted_at").eq("user_id", id).order("submitted_at", { ascending: false });
+    const { data: quizRows } = await sb.from("quizzes").select("id,title,course_id,path_id");
+    const quizName = (qid) => { const z = (quizRows || []).find((x) => x.id === qid); if (!z) return "Quiz";
+      const owner = z.path_id ? catalog.paths.find((x) => x.id === z.path_id) : catalog.courses.find((x) => x.id === z.course_id); return `${z.title} (${owner?.title || ""})`; };
+    await loadCatalog();
     const me = p.id === session.user.id;
     const started = courses.filter((c) => c.lessons_done > 0);
     const ans = (answers || []).map((a) => ({ q: (qs || []).find((x) => x.id === a.question_id), o: (os || []).find((x) => x.id === a.option_id), at: a.answered_at })).filter((x) => x.q && x.o);
@@ -1384,6 +1712,11 @@
             <td>${c.lessons_done} of ${c.lessons_total}</td><td>${c.last_activity ? fmtDate(c.last_activity) : ""}</td>
             <td>${c.certified_at ? `<span class="pill">${fmtDate(c.certified_at)}</span>` : `<span class="muted">In progress</span>`}</td></tr>`).join("")}
           </tbody></table></div>` : `<p class="muted">Has not started a course yet.</p>`}
+        <h2 style="margin-top:32px">Quizzes and exams</h2>
+        ${attempts && attempts.length ? `<div class="table-scroll"><table>
+          <thead><tr><th>Quiz</th><th>Score</th><th>Result</th><th>Taken</th></tr></thead>
+          <tbody>${attempts.map((a) => `<tr><td>${esc(quizName(a.quiz_id))}</td><td>${a.score_pct}%</td><td>${a.passed ? `<span class="pill">Passed</span>` : `<span class="muted">Not passed</span>`}</td><td>${fmtDate(a.submitted_at)}</td></tr>`).join("")}</tbody></table></div>`
+          : `<p class="muted">No quiz attempts yet.</p>`}
         <h2 style="margin-top:32px">Starting survey</h2>
         ${ans.length ? `<dl class="answers">${ans.map((a) => `<div><dt>${esc(a.q.prompt)}</dt><dd>${esc(a.o.label)}</dd></div>`).join("")}</dl>
             <p class="muted small">Answered ${fmtDate(ans[0].at)}</p>`
@@ -1401,6 +1734,308 @@
           toast(making ? "Admin access granted" : "Admin access removed");
           render();
         });
+      },
+    };
+  }
+
+  // ---------- views: quiz editor (admins) ----------
+  const KINDS = { choice: "Multiple choice", truefalse: "True or false", multi: "Select all that apply", slider: "Slider", pin: "Pin on a picture", order: "Put in order" };
+
+  async function getOrCreateQuiz(kind, id) {
+    const col = kind === "path" ? "path_id" : "course_id";
+    let { data, error } = await sb.from("quizzes").select("*").eq(col, id).maybeSingle();
+    if (error) throw error;
+    if (!data) {
+      const ins = await sb.from("quizzes").insert({ [col]: id, title: kind === "path" ? "Master exam" : "End-of-course quiz" }).select("*").single();
+      if (ins.error) throw ins.error;
+      data = ins.data;
+    }
+    return data;
+  }
+
+  async function viewManageQuiz(kind, id) {
+    if (!profile?.is_admin) return adminOnly();
+    await loadCatalog();
+    const owner = kind === "path" ? catalog.paths.find((p) => p.id === Number(id)) : catalog.courses.find((c) => c.id === Number(id));
+    if (!owner) return notFound(kind);
+    const quiz = await getOrCreateQuiz(kind, owner.id);
+    const { data: qs, error } = await sb.from("quiz_questions").select("id,sort,kind,prompt,help_lesson_id").eq("quiz_id", quiz.id).order("sort").order("id");
+    if (error) throw error;
+    const isExam = kind === "path";
+    return {
+      html: `<section class="page-title">
+        <p class="crumb"><a href="#/manage">Content</a> / ${esc(owner.title)} / ${isExam ? "Master exam" : "Quiz"}</p>
+        <div class="page-head"><h1>${isExam ? "Master exam" : "End-of-course quiz"}: ${esc(owner.title)}</h1></div>
+        <p class="muted">${isExam ? "Learners unlock the master exam once they have passed every course quiz in this learning path. Passing it earns the learning path certificate."
+                                  : "Learners take this after finishing every lesson in the course. The course certificate is issued only after they pass."}
+          ${qs.length ? "" : " <strong>It is hidden from learners until it has at least one question.</strong>"}</p>
+        <form id="editform" class="form edit-form" novalidate>
+          <div class="edit-grid">
+            <div>${input("title", "Title", quiz.title, "text", "required")}</div>
+            <div>${input("pass_pct", "Pass mark (%)", quiz.pass_pct, "number", 'min="0" max="100" required')}</div>
+          </div>
+          ${textarea("intro", "Introduction shown before they start (optional)", quiz.intro, 2)}
+          <label class="check"><input type="checkbox" name="active" ${quiz.active ? "checked" : ""}> Open to learners</label>
+          <p class="form-error" id="formerr" role="alert" hidden></p>
+          <div class="row edit-buttons"><button class="btn btn-primary" type="submit">Save settings</button></div>
+        </form>
+        <div class="page-head" style="margin-top:36px"><h2>Questions</h2>
+          <div class="row"><label for="addkind" class="sr">Question type</label>
+            <select id="addkind" style="width:auto">${Object.entries(KINDS).map(([k, l]) => `<option value="${k}">${l}</option>`).join("")}</select>
+            <button class="btn btn-primary btn-sm" id="addq" type="button">Add question</button></div></div>
+        ${qs.length ? `<ol class="edit-list qlist">${qs.map((q, i) => `<li class="edit-row">
+            <span class="edit-kind">${KINDS[q.kind]}</span>
+            <a class="edit-title" href="#/manage/question/${q.id}">${i + 1}. ${esc(q.prompt)}</a>
+            <span class="edit-actions">
+              <button type="button" class="icon-btn" data-move="quiz_questions:${q.id}:-1" aria-label="Move up" ${i === 0 ? "disabled" : ""}>&#8593;</button>
+              <button type="button" class="icon-btn" data-move="quiz_questions:${q.id}:1" aria-label="Move down" ${i === qs.length - 1 ? "disabled" : ""}>&#8595;</button>
+              <a class="btn btn-ghost btn-sm" href="#/manage/question/${q.id}">Edit</a></span></li>`).join("")}</ol>`
+          : `<div class="empty">No questions yet. Pick a type above and add the first one.</div>`}
+      </section>`,
+      bind() {
+        bindEditForm(async (v) => {
+          if (!v.title.trim()) throw new Error("Enter a title.");
+          const { error } = await sb.from("quizzes").update({ title: v.title.trim(), intro: v.intro.trim(), pass_pct: Math.min(100, Math.max(0, Number(v.pass_pct) || 0)), active: !!v.active }).eq("id", quiz.id);
+          if (error) throw new Error(error.message);
+          quizzes = null; toast("Saved"); render();
+        });
+        document.getElementById("addq").addEventListener("click", () => go(`#/manage/question/new?quiz=${quiz.id}&kind=${document.getElementById("addkind").value}`));
+        app.querySelector(".page-title").addEventListener("click", async (e) => {
+          const b = e.target.closest("[data-move]"); if (!b || b.disabled) return;
+          const [, qid, dir] = b.dataset.move.split(":");
+          const i = qs.findIndex((x) => x.id === Number(qid));
+          try { await moveRow("quiz_questions", qs, i, Number(dir)); render(); } catch (err) { toast(err.message); }
+        });
+      },
+    };
+  }
+
+  async function viewManageQuestion(sub) {
+    if (!profile?.is_admin) return adminOnly();
+    await loadCatalog();
+    let row;
+    if (sub.isNew) {
+      const kind = KINDS[sub.q.get("kind")] ? sub.q.get("kind") : "choice";
+      row = { quiz_id: Number(sub.q.get("quiz")), kind, prompt: "", help_lesson_id: null, image_path: null, config: {}, sort: 0 };
+      const { count } = await sb.from("quiz_questions").select("id", { count: "exact", head: true }).eq("quiz_id", row.quiz_id);
+      row.sort = (count || 0) + 1;
+    } else {
+      const { data, error } = await sb.from("quiz_questions").select("*").eq("id", sub.id).maybeSingle();
+      if (error) throw error; row = data;
+    }
+    if (!row || !row.quiz_id) return notFound("question");
+    const { data: quiz } = await sb.from("quizzes").select("*").eq("id", row.quiz_id).single();
+    const backHref = quiz.path_id ? `#/manage/quiz/path/${quiz.path_id}` : `#/manage/quiz/course/${quiz.course_id}`;
+    const guides = catalog.lessons.filter((l) => l.kind === "guide");
+    const c = row.config || {};
+    const newId = () => Math.random().toString(36).slice(2, 8);
+    const optRow = (o, kind) => `<li class="opt-row" data-oid="${esc(o.id)}"><div class="opt-main">
+        ${kind === "order" ? `<span class="order-n opt-n"></span>` : `<label class="check opt-correct" title="Correct answer"><input type="${kind === "multi" ? "checkbox" : "radio"}" name="correct" value="${esc(o.id)}" ${o.correct ? "checked" : ""}> <span class="sr">Correct</span></label>`}
+        <input type="text" class="opt-label" value="${esc(o.label)}" placeholder="${kind === "order" ? "Step" : "Answer text"}" aria-label="Answer text">
+        ${kind === "order" ? `<button type="button" class="icon-btn" data-dir="-1" aria-label="Move up">&#8593;</button><button type="button" class="icon-btn" data-dir="1" aria-label="Move down">&#8595;</button>` : ""}
+        <button type="button" class="icon-btn opt-del" aria-label="Remove">&times;</button></div></li>`;
+
+    let kindFields = "";
+    switch (row.kind) {
+      case "choice": case "multi": case "order":
+        kindFields = `<label>${row.kind === "order" ? "Steps, in the correct order (learners see them shuffled)" : row.kind === "multi" ? "Answers (tick every correct one)" : "Answers (tick the correct one)"}</label>
+          <ol class="opt-list" id="opts">${(c.options || [{ id: newId(), label: "" }, { id: newId(), label: "" }]).map((o) => optRow(o, row.kind)).join("")}</ol>
+          <button type="button" class="btn btn-ghost btn-sm" id="addopt" style="justify-self:start;margin-top:8px">Add ${row.kind === "order" ? "step" : "answer"}</button>`;
+        break;
+      case "truefalse":
+        kindFields = `<label>Correct answer</label>
+          <label class="check"><input type="radio" name="answer" value="true" ${c.answer !== false ? "checked" : ""}> True</label>
+          <label class="check"><input type="radio" name="answer" value="false" ${c.answer === false ? "checked" : ""}> False</label>`;
+        break;
+      case "slider":
+        kindFields = `<div class="edit-grid edit-grid-4">
+            <div>${input("min", "Lowest value", c.min ?? 0, "number", 'step="any" required')}</div>
+            <div>${input("max", "Highest value", c.max ?? 100, "number", 'step="any" required')}</div>
+            <div>${input("step", "Step", c.step ?? 1, "number", 'step="any" min="0.0001" required')}</div>
+            <div>${input("unit", "Unit label (optional)", c.unit || "", "text", 'placeholder="psi, °F, volts"')}</div>
+          </div>
+          <label>Correct answer</label>
+          <label class="check"><input type="radio" name="mode" value="exact" ${c.mode !== "range" ? "checked" : ""}> One exact value</label>
+          <label class="check"><input type="radio" name="mode" value="range" ${c.mode === "range" ? "checked" : ""}> Anywhere in a range</label>
+          <div class="edit-grid" id="sliderans">
+            <div id="exactbox" ${c.mode === "range" ? "hidden" : ""}>${input("exact", "Exact value", c.exact ?? "", "number", 'step="any"')}</div>
+            <div id="rangebox" ${c.mode === "range" ? "" : "hidden"} class="edit-grid">
+              <div>${input("low", "From", c.low ?? "", "number", 'step="any"')}</div><div>${input("high", "To", c.high ?? "", "number", 'step="any"')}</div></div>
+          </div>`;
+        break;
+      case "pin":
+        kindFields = `<label for="image">Picture</label>
+          <div class="file-box"><input id="image" name="image" type="file" accept="image/png,image/jpeg,image/webp">
+            <p class="muted small">${row.image_path ? "A picture is attached. Choose a new one to replace it." : "PNG, JPEG, or WebP up to 8 MB."}</p></div>
+          <label>Correct area — drag a box on the picture</label>
+          <div class="pin-editor ${row.image_path ? "" : "is-empty"}" id="pinedit">
+            <img id="pinimg" src="${esc(publicImage(row.image_path))}" alt="" draggable="false" ${row.image_path ? "" : "hidden"}>
+            <div class="pin-box" id="pinbox" ${c.w ? `style="left:${c.x * 100}%;top:${c.y * 100}%;width:${c.w * 100}%;height:${c.h * 100}%"` : "hidden"}></div>
+            ${row.image_path ? "" : `<p class="muted">Upload a picture first.</p>`}
+          </div>
+          <p class="muted small" id="pinhint">${c.w ? "Drag again to redraw the box." : "The learner's pin must land inside the box to be correct."}</p>`;
+        break;
+    }
+    if (row.kind !== "pin") kindFields += `<label for="image">Picture above the question (optional)</label>
+      <div class="file-box"><input id="image" name="image" type="file" accept="image/png,image/jpeg,image/webp">
+        <p class="muted small">${row.image_path ? "A picture is attached. Choose a new one to replace it." : "PNG, JPEG, or WebP up to 8 MB."}</p>
+        ${row.image_path ? `<label class="check"><input type="checkbox" name="remove_image"> Remove the picture</label>` : ""}</div>`;
+
+    return {
+      html: editShell({ crumb: `<a href="${backHref}">${esc(quiz.title)}</a> / ${sub.isNew ? "New question" : "Edit question"}`, title: `${sub.isNew ? "New" : "Edit"} question: ${KINDS[row.kind]}`, isNew: sub.isNew, deleteLabel: "Delete question",
+        fields: `
+          ${textarea("prompt", "Question", row.prompt, 2, "required")}
+          <label for="help_lesson_id">Guide the learner can open for help (optional)</label>
+          <select id="help_lesson_id" name="help_lesson_id"><option value="">None</option>
+            ${guides.map((g) => `<option value="${g.id}" ${g.id === row.help_lesson_id ? "selected" : ""}>${esc(g.title)}</option>`).join("")}</select>
+          <div class="kind-fields">${kindFields}</div>` }),
+      bind() {
+        const list = document.getElementById("opts");
+        const renumber = () => list && list.querySelectorAll(".opt-n").forEach((n, i) => { n.textContent = i + 1; });
+        if (list) {
+          renumber();
+          document.getElementById("addopt").addEventListener("click", () => { list.insertAdjacentHTML("beforeend", optRow({ id: newId(), label: "" }, row.kind)); renumber(); list.lastElementChild.querySelector(".opt-label").focus(); });
+          list.addEventListener("click", (e) => {
+            const d = e.target.closest(".opt-del"); if (d) { d.closest(".opt-row").remove(); renumber(); return; }
+            const m = e.target.closest("[data-dir]"); if (!m) return;
+            const li = m.closest("li"), dir = Number(m.dataset.dir);
+            if (dir < 0 && li.previousElementSibling) list.insertBefore(li, li.previousElementSibling);
+            if (dir > 0 && li.nextElementSibling) list.insertBefore(li.nextElementSibling, li);
+            renumber();
+          });
+        }
+        document.querySelectorAll("input[name=mode]").forEach((r) => r.addEventListener("change", () => {
+          const range = document.querySelector("input[name=mode]:checked").value === "range";
+          document.getElementById("exactbox").hidden = range; document.getElementById("rangebox").hidden = !range;
+        }));
+
+        // pin editor: preview a newly chosen picture, drag to draw the correct box
+        let box = c.w ? { x: c.x, y: c.y, w: c.w, h: c.h } : null;
+        const img = document.getElementById("pinimg"), pe = document.getElementById("pinedit"), pb = document.getElementById("pinbox");
+        const imageInput = document.getElementById("image");
+        if (img) {
+          imageInput.addEventListener("change", () => {
+            const f = imageInput.files[0]; if (!f) return;
+            img.src = URL.createObjectURL(f); img.hidden = false; pe.classList.remove("is-empty"); pe.querySelector("p")?.remove();
+            box = null; pb.hidden = true;
+          });
+          let drag = null;
+          const pos = (e) => { const r = img.getBoundingClientRect(); const t = e.touches ? e.touches[0] : e;
+            return { x: Math.min(1, Math.max(0, (t.clientX - r.left) / r.width)), y: Math.min(1, Math.max(0, (t.clientY - r.top) / r.height)) }; };
+          const paintBox = (b) => { pb.hidden = false; pb.style.left = b.x * 100 + "%"; pb.style.top = b.y * 100 + "%"; pb.style.width = b.w * 100 + "%"; pb.style.height = b.h * 100 + "%"; };
+          const startD = (e) => { if (img.hidden) return; drag = pos(e); e.preventDefault(); };
+          const moveD = (e) => { if (!drag) return; const p2 = pos(e); const b = { x: Math.min(drag.x, p2.x), y: Math.min(drag.y, p2.y), w: Math.abs(p2.x - drag.x), h: Math.abs(p2.y - drag.y) }; paintBox(b); box = b; e.preventDefault(); };
+          const endD = () => { if (drag && box && (box.w < 0.01 || box.h < 0.01)) { box = null; pb.hidden = true; } if (box) document.getElementById("pinhint").textContent = "Drag again to redraw the box."; drag = null; };
+          pe.addEventListener("mousedown", startD); window.addEventListener("mousemove", moveD); window.addEventListener("mouseup", endD);
+          pe.addEventListener("touchstart", startD, { passive: false }); pe.addEventListener("touchmove", moveD, { passive: false }); pe.addEventListener("touchend", endD);
+        }
+
+        bindEditForm(async (v) => {
+          if (!v.prompt.trim()) throw new Error("Enter the question.");
+          let config = {};
+          switch (row.kind) {
+            case "choice": case "multi": case "order": {
+              const opts = [...list.querySelectorAll(".opt-row")].map((li) => ({ id: li.dataset.oid, label: li.querySelector(".opt-label").value.trim(),
+                correct: row.kind === "order" ? undefined : !!li.querySelector("input[name=correct]")?.checked }));
+              if (opts.length < 2) throw new Error("Add at least two answers.");
+              if (opts.some((o) => !o.label)) throw new Error("Every answer needs text.");
+              if (row.kind === "choice" && opts.filter((o) => o.correct).length !== 1) throw new Error("Tick exactly one correct answer.");
+              if (row.kind === "multi" && !opts.some((o) => o.correct)) throw new Error("Tick at least one correct answer.");
+              config = { options: opts.map((o) => row.kind === "order" ? { id: o.id, label: o.label } : o) };
+              break;
+            }
+            case "truefalse": config = { answer: v.answer === "true" }; break;
+            case "slider": {
+              const min = Number(v.min), max = Number(v.max), step = Number(v.step);
+              if (!(max > min)) throw new Error("The highest value must be more than the lowest.");
+              if (!(step > 0)) throw new Error("Step must be more than zero.");
+              config = { min, max, step, unit: v.unit.trim(), mode: v.mode };
+              if (v.mode === "range") {
+                const low = Number(v.low), high = Number(v.high);
+                if (v.low === "" || v.high === "" || !(high >= low)) throw new Error("Enter the range, lowest first.");
+                if (low < min || high > max) throw new Error("The range must sit between the lowest and highest values.");
+                Object.assign(config, { low, high });
+              } else {
+                if (v.exact === "") throw new Error("Enter the exact correct value.");
+                const exact = Number(v.exact);
+                if (exact < min || exact > max) throw new Error("The correct value must sit between the lowest and highest values.");
+                config.exact = exact;
+              }
+              break;
+            }
+            case "pin":
+              if (!row.image_path && !imageInput.files[0]) throw new Error("Upload a picture.");
+              if (!box) throw new Error("Drag a box on the picture to mark the correct area.");
+              config = { x: +box.x.toFixed(4), y: +box.y.toFixed(4), w: +box.w.toFixed(4), h: +box.h.toFixed(4) };
+              break;
+          }
+          const values = { quiz_id: row.quiz_id, kind: row.kind, prompt: v.prompt.trim(), help_lesson_id: v.help_lesson_id ? Number(v.help_lesson_id) : null, config, sort: row.sort };
+          const file = imageInput?.files[0];
+          if (file) values.image_path = await uploadImage(file, "quiz");
+          else if (v.remove_image) values.image_path = null;
+          await saveRow("quiz_questions", sub.id, values);
+          if ((file || v.remove_image) && row.image_path) sb.storage.from("images").remove([row.image_path]);
+          quizzes = null; toast(sub.isNew ? "Question added" : "Saved"); go(backHref);
+        });
+        bindDelete("Delete this question?", async () => { await deleteRow("quiz_questions", sub.id); if (row.image_path) sb.storage.from("images").remove([row.image_path]); quizzes = null; });
+        const cancel = app.querySelector(".edit-buttons a.btn-ghost"); if (cancel) cancel.href = backHref;
+      },
+    };
+  }
+
+  // ---------- views: guide groups (admins) ----------
+  async function viewManageGroups() {
+    if (!profile?.is_admin) return adminOnly();
+    await loadCatalog();
+    const { data: groups, error } = await sb.from("guide_groups").select("*").order("sort").order("name");
+    if (error) throw error;
+    const count = (g) => catalog.lessons.filter((l) => l.group_id === g.id).length;
+    return {
+      html: `<section class="page-title">
+        <p class="crumb"><a href="#/manage">Content</a> / Guide groups</p>
+        <div class="page-head"><h1>Guide groups</h1><a class="btn btn-primary" href="#/manage/group/new">Add group</a></div>
+        <p class="muted">Groups are folders in the Resource Library. A guide joins a group from its own editor. Guides without a group show as their own tile.</p>
+        ${groups.length ? `<ul class="grid">${groups.map((g) => `<li class="card">
+            <a class="thumb ${g.image_path ? "" : "thumb-plain"}" href="#/manage/group/${g.id}" tabindex="-1" aria-hidden="true">${g.image_path ? `<img src="${esc(publicImage(g.image_path))}" alt="">` : ""}</a>
+            <div class="card-body"><span class="card-kind">${count(g)} guide${count(g) === 1 ? "" : "s"}</span>
+              <h3><a href="#/manage/group/${g.id}">${esc(g.name)}</a></h3>
+              <p class="card-desc">${esc(g.keywords)}</p></div></li>`).join("")}</ul>`
+          : `<div class="empty">No groups yet.</div>`}
+      </section>` };
+  }
+
+  async function viewManageGroup(sub) {
+    if (!profile?.is_admin) return adminOnly();
+    await loadCatalog();
+    let row = { name: "", keywords: "", image_path: null, sort: 0 };
+    if (!sub.isNew) {
+      const { data, error } = await sb.from("guide_groups").select("*").eq("id", sub.id).maybeSingle();
+      if (error) throw error; if (!data) return notFound("group"); row = data;
+    }
+    const members = sub.isNew ? [] : catalog.lessons.filter((l) => l.group_id === row.id);
+    return {
+      html: editShell({ crumb: `<a href="#/manage/groups">Guide groups</a> / ${sub.isNew ? "New group" : esc(row.name)}`, title: sub.isNew ? "New group" : "Edit group", isNew: sub.isNew, deleteLabel: "Delete group",
+        fields: `
+          ${input("name", "Group name", row.name, "text", "required")}
+          ${textarea("keywords", "Search keywords (words learners might type, separated by commas)", row.keywords, 2)}
+          <label for="image">Thumbnail picture${sub.isNew ? "" : " (choose a new one to replace it)"}</label>
+          <div class="file-box"><input id="image" name="image" type="file" accept="image/png,image/jpeg,image/webp" ${row.image_path ? "" : "required"}>
+            <p class="muted small">PNG, JPEG, or WebP up to 8 MB. Shown on the group's tile in the Resource Library.</p></div>
+          ${row.image_path ? `<img class="group-preview" src="${esc(publicImage(row.image_path))}" alt="">` : ""}`,
+        aside: members.length ? `<h2 style="margin-top:36px">Guides in this group</h2><ul class="edit-list">${members.map((l) => `<li class="edit-row opt-view"><a class="edit-title" href="#/manage/lesson/${l.id}">${esc(l.title)}</a><span class="muted small">${esc(catalog.courses.find((c) => c.id === l.course_id)?.title || "")}</span></li>`).join("")}</ul>` : "" }),
+      bind() {
+        bindEditForm(async (v) => {
+          if (!v.name.trim()) throw new Error("Enter a name.");
+          const file = document.getElementById("image").files[0];
+          if (!file && !row.image_path) throw new Error("Choose a thumbnail picture.");
+          const values = { name: v.name.trim(), keywords: v.keywords.trim(), sort: row.sort };
+          if (file) values.image_path = await uploadImage(file, "groups");
+          await saveRow("guide_groups", sub.id, values);
+          if (file && row.image_path) sb.storage.from("images").remove([row.image_path]);
+          toast(sub.isNew ? "Group created" : "Saved"); go("#/manage/groups");
+        });
+        bindDelete(`Delete "${row.name}"? Its guides are kept and go back to showing as their own tiles.`, async () => { await deleteRow("guide_groups", sub.id); if (row.image_path) sb.storage.from("images").remove([row.image_path]); });
+        const cancel = app.querySelector(".edit-buttons a.btn-ghost"); if (cancel) cancel.href = "#/manage/groups";
       },
     };
   }
@@ -1565,7 +2200,7 @@
         case "learn": v = await viewLearn(); break;
         case "course": v = await viewCourse(r.param); break;
         case "lesson": v = await viewLesson(r.param); break;
-        case "guides": v = await viewGuides(); break;
+        case "guides": v = r.param.startsWith("group/") ? await viewGuideGroup(r.param.split("/")[1]) : await viewGuides(); break;
         case "videos": v = await viewVideos(); break;
         case "certificates": v = await viewCertificates(); break;
         case "admin": {
@@ -1574,11 +2209,16 @@
           break;
         }
         case "welcome": v = await viewWelcome(); break;
+        case "quiz": v = await viewQuiz(r.param); break;
         case "manage": {
           const sub = parseSub(r.param);
           v = sub.kind === "path" ? await viewManagePath(sub)
             : sub.kind === "course" ? await viewManageCourse(sub)
             : sub.kind === "lesson" ? await viewManageLesson(sub)
+            : sub.kind === "quiz" ? await viewManageQuiz(sub.rest, (r.param.split("/")[2] || "").split("?")[0])
+            : sub.kind === "question" ? await viewManageQuestion(sub)
+            : sub.kind === "groups" ? await viewManageGroups()
+            : sub.kind === "group" ? await viewManageGroup(sub)
             : sub.kind === "survey" && sub.rest ? await viewManageSurveyQuestion(sub)
             : sub.kind === "survey" ? await viewManageSurvey()
             : await viewManage();
@@ -1611,7 +2251,7 @@
       const hadSession = !!session;
       session = s;
       // Never call Supabase from inside this callback; defer instead.
-      if (event === "SIGNED_OUT" && hadSession) setTimeout(() => { profile = null; catalog = null; survey = null; go("#/"); }, 0);
+      if (event === "SIGNED_OUT" && hadSession) setTimeout(() => { profile = null; catalog = null; survey = null; quizzes = null; go("#/"); }, 0);
     });
 
     const { data } = await sb.auth.getSession();   // also finishes handling email-link tokens in the URL
@@ -1636,3 +2276,4 @@
 
   start();
 })();
+
