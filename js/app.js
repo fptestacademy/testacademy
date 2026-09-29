@@ -309,6 +309,8 @@
   function courseState(c, done) {
     const path = catalog.paths.find((p) => p.id === c.path_id);
     if (path && isWaived(path)) return { locked: false, waived: true, complete: true };
+    const cur = currentPath(done);
+    if (path && cur && rung(path) > rung(cur)) return { locked: true, future: true, waived: false, complete: false };
     const cs = catalog.courses.filter((x) => x.path_id === c.path_id).sort((a, b) => a.sort - b.sort || a.id - b.id);
     const i = cs.findIndex((x) => x.id === c.id);
     const prev = cs[i - 1];
@@ -331,8 +333,16 @@
   // The rung the learner is working on: the first path from their start upward that is not finished.
   function currentPath(done) {
     const l = ladder(); const sp = startPath(); if (!sp) return null;
-    return l.slice(rung(sp)).find((p) => !pathProgress(p, done).finished) || sp;
+    return l.slice(rung(sp)).find((p) => !pathFinished(p, done)) || l[l.length - 1];
   }
+  // Finished without going through courseState, so currentPath and courseState do not call each other in a loop.
+  function pathFinished(path, done) {
+    const cs = catalog.courses.filter((x) => x.path_id === path.id);
+    const exam = examForPath(path.id);
+    if (exam) return exam.passed;
+    return cs.length > 0 && cs.every((c) => courseComplete(c, done));
+  }
+  const allFinished = (done) => catalog.paths.length > 0 && ladder().every((p) => isWaived(p) || pathFinished(p, done));
 
   const lessonsOf = (courseId) => catalog.lessons.filter((l) => l.course_id === courseId);
   function courseStats(course, done) {
@@ -678,6 +688,9 @@
       return { html: `<section class="pad"><h1>No courses yet</h1><p>Add paths, courses, and lessons under Content.</p></section>` };
     const paths = ladder();
     const cur = currentPath(done);
+    const finishedAll = allFinished(done);
+    const curRung = cur ? rung(cur) : 0;
+    const openPath = (p) => finishedAll || rung(p) <= curRung;
     const prog = cur ? pathProgress(cur, done) : null;
     const nextLesson = prog && prog.next ? courseStats(prog.next, done).next : null;
     const first = (profile?.full_name || "").split(" ")[0];
@@ -686,7 +699,15 @@
     const all = catalog.courses.map((c) => ({ course: c, st: courseStats(c, done), state: courseState(c, done) }))
       .sort((a, b) => order.get(a.course.path_id) - order.get(b.course.path_id) || a.course.sort - b.course.sort);
 
-    const hero = cur ? `
+    const hero = finishedAll ? `
+      <div class="path-hero is-done">
+        <div class="path-hero-main">
+          <span class="upnext-label">All done</span>
+          <span class="path-hero-title">Congratulations, you have completed every learning path</span>
+          <div class="path-facts"><span>${paths.length} learning path${paths.length === 1 ? "" : "s"}</span><span>${catalog.courses.length} courses</span><span>Every course is open to review below</span></div>
+        </div>
+        <div class="path-hero-cta"><a class="btn btn-accent" href="#/certificates">Your certificates</a></div>
+      </div>` : cur ? `
       <div class="path-hero">
         <div class="path-hero-main">
           <span class="upnext-label">${prog.waived ? "Waived path" : "Your learning path"}</span>
@@ -716,8 +737,10 @@
         ${hero}
         <div class="toolbar">
           <div class="chips" id="chips" role="group" aria-label="Filter by learning path">
-            <button class="chip" type="button" data-path="" aria-pressed="true">All courses</button>
-            ${paths.map((p) => `<button class="chip ${cur && p.id === cur.id ? "chip-current" : ""}" type="button" data-path="${p.id}" aria-pressed="false">${esc(p.title)}${isWaived(p) ? " ✓" : ""}</button>`).join("")}
+            ${finishedAll ? `<button class="chip" type="button" data-path="" aria-pressed="true">All courses</button>` : ""}
+            ${paths.map((p) => openPath(p)
+              ? `<button class="chip ${cur && p.id === cur.id && !finishedAll ? "chip-current" : ""}" type="button" data-path="${p.id}" aria-pressed="${!finishedAll && cur && p.id === cur.id ? "true" : "false"}">${esc(p.title)}${isWaived(p) || (finishedAll ? false : pathFinished(p, done)) ? " ✓" : ""}</button>`
+              : `<span class="chip chip-locked" aria-disabled="true" title="Unlocks after your current learning path">${esc(p.title)}</span>`).join("")}
           </div>
           <label for="q" class="sr">Search courses</label>
           <input id="q" class="search" type="search" placeholder="Search courses" autocomplete="off">
@@ -734,13 +757,14 @@
             </li>`; }).join("")}</ul>` : ""}
       </section>`,
       bind() {
-        let pathId = "";
-        const items = all.map((x) => ({ pathId: String(x.course.path_id), html: courseCard(x.course, x.st, x.state),
+        let pathId = finishedAll || !cur ? "" : String(cur.id);
+        const items = all.filter((x) => openPath(catalog.paths.find((p) => p.id === x.course.path_id)))
+          .map((x) => ({ pathId: String(x.course.path_id), html: courseCard(x.course, x.st, x.state),
           hay: (x.course.title + " " + x.course.description).toLowerCase() }));
         const grid = bindGrid(document.getElementById("grid"), (q, page) =>
           gridPage(items.filter((it) => !pathId || it.pathId === pathId), { q, page, emptyText: "No courses match. Try another word or clear the filter." }));
         document.getElementById("chips").addEventListener("click", (e) => {
-          const b = e.target.closest(".chip"); if (!b) return;
+          const b = e.target.closest("button.chip"); if (!b) return;
           pathId = b.dataset.path;
           document.querySelectorAll("#chips .chip").forEach((c) => c.setAttribute("aria-pressed", String(c === b)));
           grid.reset();
@@ -804,7 +828,8 @@
     if (state.locked) return {
       html: `<section class="pad">${head}
         <div class="locked-box"><span class="lock" aria-hidden="true"></span><div><h2>Locked</h2>
-          <p>Finish <a href="#/course/${esc(prev.slug)}">${esc(prev.title)}</a>${quizForCourse(prev.id) ? " and pass its quiz" : ""} to unlock this course.</p></div></div>
+          <p>${state.future ? `Finish your current learning path, <strong>${esc(currentPath(done)?.title || "")}</strong>, to unlock ${esc(path?.title || "this path")}.`
+                            : `Finish <a href="#/course/${esc(prev.slug)}">${esc(prev.title)}</a>${quizForCourse(prev.id) ? " and pass its quiz" : ""} to unlock this course.`}</p></div></div>
         <p class="muted">Course ${idx + 1} of ${cs.length} in ${esc(path?.title || "this path")}.</p></section>`,
       bind() { document.getElementById("share").addEventListener("click", () => share(course.title, `#/course/${course.slug}`)); },
     };
@@ -856,7 +881,7 @@
     if (error) throw error;
     const course = catalog.courses.find((c) => c.id === lesson.course_id);
     await loadQuizzes();
-    if (courseState(course, done).locked) return viewCourse(course.slug);
+    const locked = courseState(course, done).locked;
     const siblings = lessonsOf(course.id);
     const i = siblings.findIndex((l) => l.id === lesson.id);
     const prev = siblings[i - 1], next = siblings[i + 1];
@@ -877,6 +902,7 @@
         <div class="prose">${md(lesson.body)}</div>
         <div class="complete-box" id="completebox">
           ${doneAt ? `<p class="done-note">Completed on ${fmtDate(doneAt)}</p>`
+                   : locked ? `<p class="muted" style="margin:0">This lesson is from a course you have not reached yet. You can read it any time from the Resource Library; progress is tracked once you get there.</p>`
                    : `<button class="btn btn-primary" id="complete" type="button">Mark lesson complete</button>`}
           ${next ? `<a class="btn btn-ghost" href="#/lesson/${esc(next.slug)}">Next lesson: ${esc(next.title)}</a>`
                  : `<a class="btn btn-ghost" href="#/course/${esc(course.slug)}">Back to course</a>`}
@@ -920,7 +946,7 @@
 
   async function loadGuides() {
     const [{ data, error }, { data: groups, error: e2 }] = await Promise.all([
-      sb.from("lessons").select("id,slug,title,body,description,pdf_text,pdf_path,thumb_path,group_id,course_id,minutes").eq("kind", "guide").order("title"),
+      sb.from("lessons").select("id,slug,title,kind,video_url,body,description,pdf_text,pdf_path,thumb_path,group_id,course_id,minutes").order("title"),
       sb.from("guide_groups").select("*").order("sort").order("name")]);
     if (error || e2) throw error || e2;
     // one request signs every thumbnail for an hour
@@ -937,6 +963,16 @@
 
   function guideTile(g, thumbs) {
     const course = catalog.courses.find((c) => c.id === g.course_id)?.title || "";
+    if (g.kind === "video") {
+      const id = ytId(g.video_url);
+      return `<li class="card">
+        <a class="thumb thumb-play ${id ? "" : "thumb-plain"}" href="#/lesson/${esc(g.slug)}" tabindex="-1" aria-hidden="true">${id ? `<img src="https://img.youtube.com/vi/${id}/hqdefault.jpg" alt="" loading="lazy">` : ""}</a>
+        <div class="card-body">
+          <span class="card-kind">Video, ${g.minutes} min${course ? `, ${esc(course)}` : ""}</span>
+          <h3><a href="#/lesson/${esc(g.slug)}">${esc(g.title)}</a></h3>
+          <p class="card-desc">${esc(g.description || course)}</p>
+        </div></li>`;
+    }
     const t = g.thumb_path && thumbs.get(g.thumb_path);
     return `<li class="card">
       <a class="thumb thumb-doc ${t ? "" : "thumb-plain"}" href="#/lesson/${esc(g.slug)}" tabindex="-1" aria-hidden="true">${t ? `<img src="${esc(t)}" alt="" loading="lazy">` : ""}</a>
@@ -963,17 +999,18 @@
     const hay = (g) => [g.title, g.description, g.body, g.pdf_text].join(" ").toLowerCase();
     const ghay = (gr) => (gr.name + " " + gr.keywords).toLowerCase();
     const match = (text, q) => q.split(/\s+/).every((w) => text.includes(w));
-    const inGroup = (id) => guides.filter((g) => g.group_id === id);
+    const inGroup = (id) => guides.filter((g) => g.kind === "guide" && g.group_id === id);
 
     // Tiles: groups first, then ungrouped guides. A search shows the groups whose guides (or name/keywords) match, plus matching ungrouped guides.
+    let kind = "";   // "" = everything, "guide", "video"
     const build = (q) => {
       const tiles = [];
-      for (const gr of groups) {
+      if (kind !== "video") for (const gr of groups) {
         const members = inGroup(gr.id);
         const hits = q ? members.filter((g) => match(hay(g), q)).length : 0;
         if (!q || hits || match(ghay(gr), q)) tiles.push({ html: groupTile(gr, members.length, hits), hay: "" });
       }
-      for (const g of guides.filter((g) => !g.group_id || !groups.some((gr) => gr.id === g.group_id))) {
+      for (const g of guides.filter((g) => (!kind || g.kind === kind) && (g.kind === "video" || !g.group_id || !groups.some((gr) => gr.id === g.group_id)))) {
         if (!q || match(hay(g), q)) tiles.push({ html: guideTile(g, thumbs), hay: "" });
       }
       return tiles;
@@ -981,14 +1018,26 @@
     return {
       html: `<section class="page-title">
         <h1>Resource Library</h1>
+        <p class="muted">Every guide and video from every course, open to you at any time. Search by symptom, part, or error.</p>
         <div class="toolbar">
-          <p class="muted" style="margin:0">Troubleshooting guides from every course. Search by symptom, part, or error.</p>
-          <label for="q" class="sr">Search guides</label>
-          <input id="q" class="search" type="search" placeholder="Search guides" autocomplete="off">
+          <div class="chips" id="kinds" role="group" aria-label="Filter by type">
+            <button class="chip" type="button" data-kind="" aria-pressed="true">Everything</button>
+            <button class="chip" type="button" data-kind="guide" aria-pressed="false">Guides</button>
+            <button class="chip" type="button" data-kind="video" aria-pressed="false">Videos</button>
+          </div>
+          <label for="q" class="sr">Search the library</label>
+          <input id="q" class="search" type="search" placeholder="Search guides and videos" autocomplete="off">
         </div>
         <div id="grid"></div></section>`,
       bind() {
-        bindGrid(document.getElementById("grid"), (q, page) => gridPage(build(q), { q: "", page, emptyText: "No guide mentions that. Try a symptom or a part name, such as “no internet” or “cable”." })).paint();
+        const grid = bindGrid(document.getElementById("grid"), (q, page) => gridPage(build(q), { q: "", page, emptyText: "Nothing mentions that. Try a symptom or a part name, such as “no internet” or “cable”." }));
+        document.getElementById("kinds").addEventListener("click", (e) => {
+          const b = e.target.closest(".chip"); if (!b) return;
+          kind = b.dataset.kind;
+          document.querySelectorAll("#kinds .chip").forEach((c) => c.setAttribute("aria-pressed", String(c === b)));
+          grid.reset();
+        });
+        grid.paint();
       },
     };
   }
@@ -998,7 +1047,7 @@
     const { guides, groups, thumbs } = await loadGuides();
     const gr = groups.find((x) => x.id === Number(id));
     if (!gr) return notFound("group");
-    const members = guides.filter((g) => g.group_id === gr.id);
+    const members = guides.filter((g) => g.kind === "guide" && g.group_id === gr.id);
     const items = members.map((g) => ({ html: guideTile(g, thumbs), hay: [g.title, g.description, g.body, g.pdf_text].join(" ").toLowerCase() }));
     return {
       html: `<section class="page-title">
